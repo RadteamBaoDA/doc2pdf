@@ -147,3 +147,7 @@ dmypy.json
 # AI Agent Specific
 .agent/memory/
 .agent/working/
+
+input
+output
+logs

@@ -144,7 +144,10 @@ def get_pdf_settings(input_path: Optional[Path] = None, file_type: FileType = "w
             if pattern == "*":
                 matching_rules.append(rule)
         else:
-            if fnmatch.fnmatch(path_str, pattern):
+            # Use Path.match for glob support including **
+            # Ensure pattern is compatible with current OS path separator if needed, 
+            # but usually Path.match handles forward slashes in pattern well.
+            if input_path.match(pattern):
                 matching_rules.append(rule)
     
     # Sort by priority (Ascending means later overrides earlier? "Higher numbers override lower numbers" -> implies Sort Ascending)

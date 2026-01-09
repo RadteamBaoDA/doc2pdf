@@ -1,0 +1,80 @@
+logging:
+  level: INFO
+  console: true
+  file:
+    enabled: true
+    path: "logs/doc2pdf_{time:YYYYMMDDHHmmss}.log"
+    rotation: "10 MB"
+    retention: "10 days"
+
+pdf_settings:
+  # Word Configuration Rules
+  word:
+    # Default Rule (Low Priority)
+    - pattern: "*"
+      priority: 10
+      settings:
+        scope: "all"  # Options: all, selection, range
+        layout:
+          orientation: "portrait"  # Options: portrait, landscape
+          pages_per_sheet: 1
+          margins: "normal"  # Options: normal, narrow, moderate, wide, mirrored
+        metadata:
+          include_properties: true
+          include_tags: true
+        bookmarks: "headings"  # Options: headings, bookmarks, none
+        compliance: "pdfa"  # Options: pdfa, standard
+        optimization:
+          image_quality: "high"  # Options: high, medium, low
+          bitmap_text: false
+
+    # Example: Confidential files override
+    - pattern: "**/CONFIDENTIAL/**"
+      priority: 100
+      settings:
+        metadata:
+          include_properties: false
+    
+    # Example: Reports need bookmarks
+    - pattern: "*report*"
+      priority: 50
+      settings:
+        bookmarks: "bookmarks"
+
+  # Excel Configuration Rules
+  excel:
+    - pattern: "*"
+      priority: 10
+      settings:
+        scope: "all"
+        layout:
+          orientation: "landscape"
+          pages_per_sheet: 1
+          margins: "normal"
+        metadata:
+          include_properties: true
+          include_tags: true
+        bookmarks: "none"
+        compliance: "pdfa"
+        optimization:
+          image_quality: "high"
+          bitmap_text: false
+
+  # PowerPoint Configuration Rules
+  powerpoint:
+    - pattern: "*"
+      priority: 10
+      settings:
+        scope: "all"
+        layout:
+          orientation: "landscape"
+          pages_per_sheet: 1
+          margins: "normal"
+        metadata:
+          include_properties: true
+          include_tags: true
+        bookmarks: "none"
+        compliance: "pdfa"
+        optimization:
+          image_quality: "high"
+          bitmap_text: false

@@ -16,6 +16,7 @@ from rich.table import Table
 
 from .version import __version__
 from .core.word_converter import WordConverter
+from .core.powerpoint_converter import PowerPointConverter
 from .utils.logger import setup_logger, logger
 from .config import get_logging_config, get_pdf_settings, FileType
 
@@ -116,8 +117,8 @@ def convert(
 
     # Initialize converters
     word_converter = WordConverter()
+    ppt_converter = PowerPointConverter()
     # excel_converter = ExcelConverter() # TODO: Implement
-    # ppt_converter = PowerPointConverter() # TODO: Implement
 
     # TUI Setup
     progress = Progress(
@@ -164,8 +165,11 @@ def convert(
                 if file_type == "word":
                     word_converter.convert(file_path, target_file, settings)
                     success_count += 1
+                elif file_type == "powerpoint":
+                    ppt_converter.convert(file_path, target_file, settings)
+                    success_count += 1
                 else:
-                    # Placeholder for other types
+                    # Placeholder for other types (Excel)
                     logger.warning(f"Conversion for {file_type} not yet implemented. Skipping {file_path.name}")
                     skipped_count += 1
                     

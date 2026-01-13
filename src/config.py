@@ -26,6 +26,13 @@ class OptimizationSettings:
     bitmap_text: bool = False
 
 @dataclass
+class PowerPointSettings:
+    """PowerPoint-specific PDF conversion settings."""
+    color_mode: str = "color"  # color, grayscale, bw
+    slide_from: Optional[int] = None  # For range scope
+    slide_to: Optional[int] = None
+
+@dataclass
 class PDFConversionSettings:
     scope: str = "all"
     layout: LayoutSettings = field(default_factory=LayoutSettings)
@@ -33,6 +40,7 @@ class PDFConversionSettings:
     bookmarks: str = "headings"
     compliance: str = "pdfa"
     optimization: OptimizationSettings = field(default_factory=OptimizationSettings)
+    powerpoint: Optional[PowerPointSettings] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PDFConversionSettings":
@@ -40,6 +48,7 @@ class PDFConversionSettings:
         layout_data = data.get("layout", {})
         metadata_data = data.get("metadata", {})
         opt_data = data.get("optimization", {})
+        ppt_data = data.get("powerpoint", {})
         
         return cls(
             scope=data.get("scope", "all"),
@@ -47,7 +56,8 @@ class PDFConversionSettings:
             metadata=MetadataSettings(**metadata_data) if metadata_data else MetadataSettings(),
             bookmarks=data.get("bookmarks", "headings"),
             compliance=data.get("compliance", "pdfa"),
-            optimization=OptimizationSettings(**opt_data) if opt_data else OptimizationSettings()
+            optimization=OptimizationSettings(**opt_data) if opt_data else OptimizationSettings(),
+            powerpoint=PowerPointSettings(**ppt_data) if ppt_data else None,
         )
 
 def load_config(path: Path = CONFIG_FILE) -> Dict[str, Any]:

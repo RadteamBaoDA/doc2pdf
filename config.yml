@@ -65,7 +65,11 @@ pdf_settings:
     - pattern: "*"
       priority: 10
       settings:
-        scope: "all"
+        scope: "all"  # Options: all, range
+        powerpoint:
+          color_mode: "color"  # Options: color, grayscale, bw
+          slide_from: null  # For range scope only
+          slide_to: null    # For range scope only
         layout:
           orientation: "landscape"
           pages_per_sheet: 1

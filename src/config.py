@@ -33,6 +33,15 @@ class PowerPointSettings:
     slide_to: Optional[int] = None
 
 @dataclass
+class ExcelSettings:
+    """Excel-specific PDF conversion settings for OCR-optimized output."""
+    sheet_name: Optional[str] = None  # Target specific sheet, None = all visible sheets
+    orientation: str = "landscape"  # portrait, landscape
+    row_dimensions: Optional[int] = None  # Rows per page: None=auto, 0=fit all on one page, N=fixed rows
+    metadata_header: bool = True  # Print header: sheet name | row range | filename
+    min_col_width_inches: float = 0.5  # Minimum column width for OCR-readable 14pt text
+
+@dataclass
 class PDFConversionSettings:
     scope: str = "all"
     layout: LayoutSettings = field(default_factory=LayoutSettings)
@@ -41,6 +50,7 @@ class PDFConversionSettings:
     compliance: str = "pdfa"
     optimization: OptimizationSettings = field(default_factory=OptimizationSettings)
     powerpoint: Optional[PowerPointSettings] = None
+    excel: Optional[ExcelSettings] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PDFConversionSettings":
@@ -50,6 +60,14 @@ class PDFConversionSettings:
         opt_data = data.get("optimization", {})
         ppt_data = data.get("powerpoint", {})
         
+        # Excel settings can be in nested 'excel' key OR at top level
+        excel_data = data.get("excel", {})
+        # Also check for top-level excel settings (flat structure)
+        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "min_col_width_inches", "sheet_name"]
+        for key in top_level_excel_keys:
+            if key in data and key not in excel_data:
+                excel_data[key] = data[key]
+        
         return cls(
             scope=data.get("scope", "all"),
             layout=LayoutSettings(**layout_data) if layout_data else LayoutSettings(),
@@ -58,6 +76,7 @@ class PDFConversionSettings:
             compliance=data.get("compliance", "pdfa"),
             optimization=OptimizationSettings(**opt_data) if opt_data else OptimizationSettings(),
             powerpoint=PowerPointSettings(**ppt_data) if ppt_data else None,
+            excel=ExcelSettings(**excel_data) if excel_data else None,
         )
 
 def load_config(path: Path = CONFIG_FILE) -> Dict[str, Any]:
@@ -105,6 +124,27 @@ def get_logging_config() -> Dict[str, Any]:
         merged["file"] = merged_file
         
     return merged
+
+
+def get_suffix_config() -> Dict[str, str]:
+    """
+    Get PDF filename suffix configuration per document type.
+    
+    Returns:
+        Dict with keys 'word', 'powerpoint', 'excel' and their suffix values.
+    """
+    config = load_config()
+    suffix_config = config.get("suffix", {})
+    
+    # Defaults (empty suffix)
+    defaults = {
+        "word": "",
+        "powerpoint": "",
+        "excel": ""
+    }
+    
+    defaults.update(suffix_config)
+    return defaults
 
 def _merge_dict(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
     """Deep merge two dictionaries."""
@@ -176,6 +216,85 @@ def get_pdf_settings(input_path: Optional[Path] = None, file_type: FileType = "w
         # But we should start with empty dict or Pydantic defaults?
         # Pydantic defaults are 'good', but nested objects might need care.
         # Let's start with empty dict and trust _merge_dict + from_dict to handle missing keys by using dataclass defaults.
+        rule_settings = rule.get("settings", {})
+        final_settings_dict = _merge_dict(final_settings_dict, rule_settings)
+        
+    return PDFConversionSettings.from_dict(final_settings_dict)
+
+
+def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConversionSettings] = None) -> PDFConversionSettings:
+    """
+    Get Excel PDF settings by applying sheet_name-based Pattern-Priority rules.
+    
+    For Excel, rules are matched by sheet_name pattern instead of file path.
+    
+    1. Fetch list of rules for 'excel'.
+    2. Filter rules where `sheet_name` matches `sheet_name` pattern.
+    3. Sort matching rules by `priority` (ascending).
+    4. Merge settings sequentially.
+    
+    Args:
+        sheet_name: The Excel sheet name to check against rule patterns.
+        base_settings: Optional base settings to merge into.
+    
+    Returns:
+        PDFConversionSettings with merged sheet-specific settings.
+    """
+    config = load_config()
+    pdf_section = config.get("pdf_settings", {})
+    
+    rules = pdf_section.get("excel", [])
+    if not isinstance(rules, list):
+        return base_settings or PDFConversionSettings()
+
+    # Filter matching rules by sheet_name pattern
+    matching_rules = []
+    for rule in rules:
+        pattern = rule.get("sheet_name", rule.get("pattern", "*"))
+        priority = rule.get("priority", 0)
+        
+        # Use fnmatch for glob-style pattern matching
+        if fnmatch.fnmatch(sheet_name, pattern):
+            matching_rules.append(rule)
+    
+    # Sort by priority ascending (higher priority overrides)
+    matching_rules.sort(key=lambda x: x.get("priority", 0))
+    
+    # Start with base settings dict or empty
+    if base_settings:
+        # Convert base_settings to dict for merging
+        from dataclasses import asdict
+        final_settings_dict = {
+            "scope": base_settings.scope,
+            "bookmarks": base_settings.bookmarks,
+            "compliance": base_settings.compliance,
+            "layout": {
+                "orientation": base_settings.layout.orientation,
+                "pages_per_sheet": base_settings.layout.pages_per_sheet,
+                "margins": base_settings.layout.margins,
+            },
+            "metadata": {
+                "include_properties": base_settings.metadata.include_properties,
+                "include_tags": base_settings.metadata.include_tags,
+            },
+            "optimization": {
+                "image_quality": base_settings.optimization.image_quality,
+                "bitmap_text": base_settings.optimization.bitmap_text,
+            },
+        }
+        if base_settings.excel:
+            final_settings_dict["excel"] = {
+                "sheet_name": base_settings.excel.sheet_name,
+                "orientation": base_settings.excel.orientation,
+                "row_dimensions": base_settings.excel.row_dimensions,
+                "metadata_header": base_settings.excel.metadata_header,
+                "min_col_width_inches": base_settings.excel.min_col_width_inches,
+            }
+    else:
+        final_settings_dict = {}
+    
+    # Merge matching rules
+    for rule in matching_rules:
         rule_settings = rule.get("settings", {})
         final_settings_dict = _merge_dict(final_settings_dict, rule_settings)
         

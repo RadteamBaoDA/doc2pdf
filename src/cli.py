@@ -17,8 +17,9 @@ from rich.table import Table
 from .version import __version__
 from .core.word_converter import WordConverter
 from .core.powerpoint_converter import PowerPointConverter
+from .core.excel_converter import ExcelConverter
 from .utils.logger import setup_logger, logger
-from .config import get_logging_config, get_pdf_settings, FileType
+from .config import get_logging_config, get_pdf_settings, get_suffix_config, FileType
 
 app = typer.Typer(
     name="doc2pdf",
@@ -48,6 +49,7 @@ def version_callback(value: bool):
 
 @app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     version: Optional[bool] = typer.Option(
         None,
         "--version",
@@ -60,7 +62,8 @@ def main(
     """
     doc2pdf - Convert your documents to PDF with ease.
     """
-    pass
+    if ctx.invoked_subcommand is None:
+        console.print(ctx.get_help())
 
 def get_files(path: Path) -> List[Path]:
     if path.is_file():
@@ -68,7 +71,7 @@ def get_files(path: Path) -> List[Path]:
     
     extensions = {
         "*.docx", "*.doc", 
-        "*.xlsx", "*.xls",
+        "*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
         "*.pptx", "*.ppt"
     }
     
@@ -81,7 +84,7 @@ def get_file_type(path: Path) -> FileType:
     ext = path.suffix.lower()
     if ext in [".docx", ".doc"]:
         return "word"
-    elif ext in [".xlsx", ".xls"]:
+    elif ext in [".xlsx", ".xls", ".xlsm", ".xlsb"]:
         return "excel"
     elif ext in [".pptx", ".ppt"]:
         return "powerpoint"
@@ -118,7 +121,7 @@ def convert(
     # Initialize converters
     word_converter = WordConverter()
     ppt_converter = PowerPointConverter()
-    # excel_converter = ExcelConverter() # TODO: Implement
+    excel_converter = ExcelConverter()
 
     # TUI Setup
     progress = Progress(
@@ -145,18 +148,25 @@ def convert(
             # Get settings based on file type and pattern overrides
             settings = get_pdf_settings(input_path=file_path, file_type=file_type)
             
-            # Determine output
+            # Get suffix for this file type
+            suffix_config = get_suffix_config()
+            suffix = suffix_config.get(file_type, "")
+            
+            # Determine output with suffix
             if output_path:
                 if input_path.is_dir():
                     # Calculate relative path to maintain structure
                     rel_path = file_path.relative_to(input_path)
-                    target_file = output_path / rel_path.with_suffix(".pdf")
+                    # Apply suffix: filename_suffix.pdf
+                    base_name = rel_path.stem + suffix + ".pdf"
+                    target_file = output_path / rel_path.parent / base_name
                     target_file.parent.mkdir(parents=True, exist_ok=True)
                 else:
                     if output_path.suffix.lower() == ".pdf":
                         target_file = output_path
                     else:
-                        target_file = output_path / file_path.with_suffix(".pdf").name
+                        base_name = file_path.stem + suffix + ".pdf"
+                        target_file = output_path / base_name
                         target_file.parent.mkdir(parents=True, exist_ok=True)
             else:
                 target_file = None 
@@ -168,9 +178,11 @@ def convert(
                 elif file_type == "powerpoint":
                     ppt_converter.convert(file_path, target_file, settings)
                     success_count += 1
+                elif file_type == "excel":
+                    excel_converter.convert(file_path, target_file, settings)
+                    success_count += 1
                 else:
-                    # Placeholder for other types (Excel)
-                    logger.warning(f"Conversion for {file_type} not yet implemented. Skipping {file_path.name}")
+                    logger.warning(f"Conversion for {file_type} not supported. Skipping {file_path.name}")
                     skipped_count += 1
                     
             except Exception as e:

@@ -6,8 +6,11 @@ from src.config import (
     _merge_dict, 
     PDFConversionSettings, 
     LayoutSettings, 
-    MetadataSettings
+    MetadataSettings,
+    PdfHandlingSettings,
+    get_pdf_handling_config
 )
+
 
 # Mock config data
 MOCK_CONFIG = {
@@ -113,3 +116,15 @@ def test_priority_sorting(mock_load_config):
         # Case 3: * + *important* + **/CLIENT/** (Highest priority wins)
         s3 = get_pdf_settings(Path("input/CLIENT/very_important_doc.docx"), "word")
         assert s3.bookmarks == "bookmarks"
+
+def test_get_pdf_handling_config(mock_load_config):
+    # Test loading PDF handling config
+    with patch("src.config.load_config", return_value={"pdf_handling": {"copy_to_output": True}}):
+        config = get_pdf_handling_config()
+        assert config.copy_to_output is True
+
+    # Test default
+    with patch("src.config.load_config", return_value={}):
+        config = get_pdf_handling_config()
+        assert config.copy_to_output is False
+

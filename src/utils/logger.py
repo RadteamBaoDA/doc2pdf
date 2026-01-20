@@ -29,7 +29,7 @@ def setup_logger(config: Optional[dict] = None) -> Optional[int]:
             format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
         )
     
-    return console_handler_id
+
 
     # File Handler
     file_config = config.get("file", {})
@@ -52,5 +52,7 @@ def setup_logger(config: Optional[dict] = None) -> Optional[int]:
             rotation=rotation,
             retention=retention,
             level=level,
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
         )
+
+    return console_handler_id
+

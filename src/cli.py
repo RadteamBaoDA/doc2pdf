@@ -28,7 +28,7 @@ from .core.powerpoint_converter import PowerPointConverter
 from .core.excel_converter import ExcelConverter
 from .core.pdf_processor import PDFProcessor
 from .utils.logger import setup_logger, logger
-from .config import get_logging_config, get_pdf_settings, get_suffix_config, get_reporting_config, get_post_processing_config, FileType
+from .config import get_logging_config, get_pdf_settings, get_suffix_config, get_reporting_config, get_post_processing_config, get_pdf_handling_config, FileType
 
 app = typer.Typer(
     name="doc2pdf",
@@ -81,7 +81,8 @@ def get_files(path: Path) -> List[Path]:
     extensions = {
         "*.docx", "*.doc", 
         "*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
-        "*.pptx", "*.ppt"
+        "*.pptx", "*.ppt",
+        "*.pdf"
     }
     
     files = []
@@ -97,6 +98,8 @@ def get_file_type(path: Path) -> FileType:
         return "excel"
     elif ext in [".pptx", ".ppt"]:
         return "powerpoint"
+    elif ext == ".pdf":
+        return "pdf"
     return "word" # Default fallback
 
 @app.command()
@@ -245,6 +248,35 @@ def convert(
                         excel_converter.convert(file_path, target_file, settings, on_progress=progress_callback)
                         converted_pdf = target_file
                         success_count += 1
+                    elif file_type == "pdf":
+                        # Log full path
+                        logger.info(f"Input PDF found: {file_path}")
+                        
+                        pdf_handling = get_pdf_handling_config()
+                        if pdf_handling.copy_to_output and target_file:
+                             # Logic to copy
+                             shutil.copy2(file_path, target_file)
+                             logger.info(f"Copied PDF to: {target_file}")
+                             converted_pdf = target_file
+                             success_count += 1
+                        else:
+                             # Just skip or count as success? 
+                             # If we don't copy, we essentially "skipped" processing it, but it was "handled".
+                             # But let's count as skipped if not copied, or success if we just wanted to log it?
+                             # Requirement: "when input have pdf, write input full path of this pdf file."
+                             # So we always do that.
+                             # If copy is disabled, we effectively did nothing else.
+                             # Let's count as skipped-by-policy or success? 
+                             # Let's count as success because we "handled" it as per config (logging).
+                             # But "skipped" might be more valuable for user stats.
+                             if not pdf_handling.copy_to_output:
+                                 logger.debug(f"PDF copy disabled. Skipping copy for {file_path.name}")
+                                 skipped_count += 1
+                             else:
+                                 # This branch is for when target_file is None (dry run?) or copy succeeded
+                                 pass 
+
+                        progress.advance(task_id, advance=1)
                     else:
                         logger.warning(f"Conversion for {file_type} not supported. Skipping {file_path.name}")
                         skipped_count += 1

@@ -29,12 +29,16 @@ xlPortrait = 1
 xlPaperLetter = 1
 xlPaperA4 = 9
 xlPaperA3 = 8
-xlPaperTabloid = 3
-xlPaperLegal = 5
-# Architecture sizes (approximate enum values, varies by driver but standard for PDF printers)
-xlPaperC = 24  # 17x22 in
-xlPaperD = 25  # 22x34 in
-xlPaperE = 26  # 34x44 in
+xlPaperA2 = 66  # 16.5x23.4 in
+xlPaperTabloid = 3  # 11x17 in
+xlPaperLegal = 5  # 8.5x14 in
+xlPaperLedger = 4  # 17x11 in (Tabloid rotated)
+xlPaperB4 = 12  # 9.84x13.9 in (JIS B4)
+xlPaperB3 = 13  # 13.9x19.7 in (JIS B3)
+# Architecture sizes
+xlPaperC = 24  # 17x22 in (Arch C)
+xlPaperD = 25  # 22x34 in (Arch D)
+xlPaperE = 26  # 34x44 in (Arch E)
 
 # Page Setup constants
 xlFitToPage = 2
@@ -224,7 +228,7 @@ class ExcelConverter(Converter):
     def _set_optimal_printer(self, excel) -> None:
         """
         Attempt to set ActivePrinter to 'Microsoft Print to PDF' for better paper size support.
-        Tries detailed port detection and fallback strategies.
+        Uses win32print API for reliable port detection, with brute-force fallback.
         """
         target_name = "Microsoft Print to PDF"
         
@@ -232,44 +236,40 @@ class ExcelConverter(Converter):
             # Check if already active
             current = excel.ActivePrinter
             if target_name in current:
+                logger.debug(f"'{target_name}' is already the active printer.")
                 return
         except:
             pass
 
-        found_printer_info = None
-        
+        # Strategy 1: Use win32print API for reliable port detection
+        port_name = None
         try:
-             # Find correct printer string with port via win32print
-            flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-            printers = win32print.EnumPrinters(flags, None, 2)
-            
-            for p in printers:
-                p_name = p.get('pPrinterName', '')
-                if p_name == target_name:
-                    found_printer_info = p
-                    break
+            handle = win32print.OpenPrinter(target_name)
+            try:
+                # Level 5 is lightweight, contains pPortName
+                info = win32print.GetPrinter(handle, 5)
+                port_name = info.get('pPortName', '')
+                
+                # Fallback to Level 2 if Level 5 didn't have port
+                if not port_name:
+                    info = win32print.GetPrinter(handle, 2)
+                    port_name = info.get('pPortName', '')
+            finally:
+                win32print.ClosePrinter(handle)
         except Exception as e:
-            logger.debug(f"Printer enumeration failed: {e}")
-            
-        if not found_printer_info:
-            logger.debug(f"Printer '{target_name}' not found in system enumeration.")
-            return
+            logger.debug(f"OpenPrinter/GetPrinter API failed for '{target_name}': {e}")
 
-        # Strategy 1: Use detected port
-        p_name = found_printer_info.get('pPrinterName')
-        p_port = found_printer_info.get('pPortName', '')
-        
+        # If we got a port name from the API and it's not PORTPROMPT, try it first
         candidates = []
-        if p_port:
-             candidates.append(f"{p_name} on {p_port}")
+        if port_name and port_name.upper() != 'PORTPROMPT:':
+            candidates.append(f"{target_name} on {port_name}")
         
-        # Strategy 2: Brute force Ne00-Ne09 (common for network/virtual printers in Excel)
-        # This handles cases where pPortName is 'PORTPROMPT:' or similar non-connectable strings
-        for i in range(10):
-            candidates.append(f"{p_name} on Ne{i:02d}:")
+        # Strategy 2: Brute force Ne00-Ne99 as fallback (expanded range)
+        for i in range(100):
+            candidates.append(f"{target_name} on Ne{i:02d}:")
             
-        # Strategy 3: Naked name (rare but possible)
-        candidates.append(p_name)
+        # Strategy 3: Naked name (rare)
+        candidates.append(target_name)
         
         success = False
         for candidate in candidates:
@@ -278,8 +278,10 @@ class ExcelConverter(Converter):
                 logger.info(f"Successfully switched ActivePrinter to: '{candidate}'")
                 success = True
                 break
-            except Exception:
-                continue
+            except Exception as e:
+                # Only log first few failures to avoid spam
+                if candidates.index(candidate) < 5:
+                    logger.debug(f"Failed to set ActivePrinter to '{candidate}': {e}")
                 
         if not success:
             logger.warning(
@@ -380,64 +382,90 @@ class ExcelConverter(Converter):
             is_landscape = (page_setup.Orientation == xlLandscape)
             
             # Define ladder of supported sizes (Enum, Landscape Width inches, Name)
-            # Widths based on standard dimensions. Portrait widths would be Height.
-            # We focus on Width for fitting columns.
+            # Arch sizes require Microsoft Print to PDF or similar virtual printer.
+            # The iterative selection will fall back if printer rejects larger sizes.
+            # Paper sizes sorted by landscape width (smallest to largest)
+            # Format: (Enum, Landscape Width in inches, Name)
             paper_ladder = [
-                (xlPaperLetter, 11.0, "Letter"),
-                (xlPaperA3, 16.54, "A3"),
-                (xlPaperC, 22.0, "Arch C"),
-                (xlPaperD, 34.0, "Arch D"),
-                (xlPaperE, 44.0, "Arch E")
+                (xlPaperLetter, 11.0, "Letter"),        # 8.5x11
+                (xlPaperB4, 13.9, "B4"),                # 9.84x13.9
+                (xlPaperLegal, 14.0, "Legal"),          # 8.5x14
+                (xlPaperA3, 16.54, "A3"),               # 11.69x16.54
+                (xlPaperTabloid, 17.0, "Tabloid"),      # 11x17
+                (xlPaperB3, 19.69, "B3"),               # 13.9x19.69
+                (xlPaperC, 22.0, "Arch C"),             # 17x22
+                (xlPaperA2, 23.39, "A2"),               # 16.54x23.39
+                (xlPaperD, 34.0, "Arch D"),             # 22x34
+                (xlPaperE, 44.0, "Arch E"),             # 34x44
             ]
             
             if not is_landscape:
-                # Approximate portrait widths
+                # Portrait widths
                 paper_ladder = [
                     (xlPaperLetter, 8.5, "Letter"),
+                    (xlPaperLegal, 8.5, "Legal"),
+                    (xlPaperB4, 9.84, "B4"),
+                    (xlPaperTabloid, 11.0, "Tabloid"),
                     (xlPaperA3, 11.69, "A3"),
+                    (xlPaperB3, 13.9, "B3"),
+                    (xlPaperA2, 16.54, "A2"),
                     (xlPaperC, 17.0, "Arch C"),
                     (xlPaperD, 22.0, "Arch D"),
-                    (xlPaperE, 34.0, "Arch E")
+                    (xlPaperE, 34.0, "Arch E"),
                 ]
 
             selected_paper = xlPaperLetter
-            available_width = 11.0
+            available_width = 11.0 if is_landscape else 8.5
             selected_name = "Letter"
             
-            # Find smallest paper that fits content OR largest available
+            # Find all paper sizes that can fit the content (smallest first)
+            # Then we'll try from largest to smallest until one works with the printer
+            viable_sizes = []
             for (enum_val, width, name) in paper_ladder:
-                selected_paper = enum_val
-                available_width = width
-                selected_name = name
                 if page_width <= width:
-                    break
+                    viable_sizes.append((enum_val, width, name))
             
-            # Apply selection
-            try:
-                page_setup.PaperSize = selected_paper
-                # Verify if applied
-                current_size = page_setup.PaperSize
-                if current_size != selected_paper:
-                    logger.warning(f"Printer rejected paper size {selected_name} (Enum {selected_paper}). Got Enum {current_size}.")
-                    # If rejected, we must revert available_width to estimated actual width
-                    # Mapping generic enums back to width is hard, but usually it reverts to Letter/A4
-                    if current_size == xlPaperLetter:
-                         available_width = 11.0 if is_landscape else 8.5
-                         selected_name = "Letter (Fallback)"
-                    elif current_size == xlPaperA4:
-                         available_width = 11.69 if is_landscape else 8.27
-                         selected_name = "A4 (Fallback)"
-                    elif current_size == xlPaperA3:
-                         available_width = 16.54 if is_landscape else 11.69
-                         selected_name = "A3 (Fallback)"
+            # If content is wider than all sizes, use the largest available
+            if not viable_sizes:
+                viable_sizes = [paper_ladder[-1]]  # Arch E
+            
+            # Try sizes from largest to smallest (reverse order from viable list)
+            # This gives us the best chance of success with the printer
+            paper_set_success = False
+            for (enum_val, width, name) in reversed(viable_sizes):
+                try:
+                    page_setup.PaperSize = enum_val
+                    # Verify if applied
+                    current_size = page_setup.PaperSize
+                    if current_size == enum_val:
+                        selected_paper = enum_val
+                        available_width = width
+                        selected_name = name
+                        paper_set_success = True
+                        break
                     else:
-                         # Unknown reset - assume worst case (Letter)
-                         available_width = 11.0 if is_landscape else 8.5
-                         selected_name = f"Unknown-{current_size} (Fallback)"
-            except Exception as e:
-                logger.warning(f"Failed to set paper size: {e}")
-                available_width = 11.0 if is_landscape else 8.5
-                selected_name = "Letter (Error)"
+                        logger.debug(f"Printer rejected {name} (Enum {enum_val}), trying next size...")
+                except Exception as e:
+                    logger.debug(f"Failed to set paper size {name}: {e}")
+                    continue
+            
+            if not paper_set_success:
+                # All sizes failed, use whatever the printer defaulted to
+                logger.warning(f"Could not set any large paper size. Using printer default.")
+                # Estimate width based on current paper size enum
+                current_size = page_setup.PaperSize
+                if current_size == xlPaperLetter:
+                    available_width = 11.0 if is_landscape else 8.5
+                    selected_name = "Letter (Fallback)"
+                elif current_size == xlPaperA4:
+                    available_width = 11.69 if is_landscape else 8.27
+                    selected_name = "A4 (Fallback)"
+                elif current_size == xlPaperA3:
+                    available_width = 16.54 if is_landscape else 11.69
+                    selected_name = "A3 (Fallback)"
+                else:
+                    available_width = 11.0 if is_landscape else 8.5
+                    selected_name = f"Unknown-{current_size} (Fallback)"
 
             if selected_name != "Letter":
                 logger.info(f"Using {selected_name} paper for sheet '{sheet.Name}' (Content: {page_width:.1f}\" <= Paper: {available_width:.1f}\")")
@@ -446,12 +474,16 @@ class ExcelConverter(Converter):
             if page_width > available_width:
                 shrink_factor = available_width / page_width
                 
-                if shrink_factor < 0.5:
-                    # Error condition as per user request
+                if shrink_factor < 0.8:
+                    # Determine the theoretical max with 0.8 shrink factor
+                    max_content_width = available_width / 0.8
+                    
+                    # Error condition: text would be too small for OCR
                     err_msg = (
-                        f"Sheet '{sheet.Name}' is too wide ({page_width:.1f}\") for largest supported paper {selected_name} ({available_width:.1f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} results in microscopic text. "
-                        f"Max supported behavior is Arch E paper."
+                        f"Sheet '{sheet.Name}' is too wide ({page_width:.1f}\") for {selected_name} paper ({available_width:.1f}\"). "
+                        f"Shrink factor {shrink_factor:.2f} < 0.8 = microscopic text. "
+                        f"Max content with 0.8 shrink: {max_content_width:.1f}\". "
+                        f"Arch E max: 55\" (44\" x 0.8 shrink). TIP: Split sheet manually."
                     )
                     logger.error(err_msg)
                     raise ValueError(err_msg)

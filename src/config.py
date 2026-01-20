@@ -107,6 +107,18 @@ class ReportingSettings:
         )
 
 @dataclass
+class PdfHandlingSettings:
+    """Settings for handling existing PDF files."""
+    copy_to_output: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PdfHandlingSettings":
+        return cls(
+            copy_to_output=data.get("copy_to_output", False)
+        )
+
+
+@dataclass
 class PDFConversionSettings:
     scope: str = "all"
     layout: LayoutSettings = field(default_factory=LayoutSettings)
@@ -242,6 +254,20 @@ def get_post_processing_config() -> PostProcessingSettings:
         return PostProcessingSettings()
     
     return PostProcessingSettings.from_dict(post_proc_data)
+
+
+def get_pdf_handling_config() -> PdfHandlingSettings:
+    """
+    Get PDF handling configuration with defaults.
+    """
+    config = load_config()
+    pdf_handling_data = config.get("pdf_handling", {})
+    
+    if not pdf_handling_data:
+        return PdfHandlingSettings()
+    
+    return PdfHandlingSettings.from_dict(pdf_handling_data)
+
 
 
 def _merge_dict(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:

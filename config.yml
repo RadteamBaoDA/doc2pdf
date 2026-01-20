@@ -41,6 +41,11 @@ reporting:
   copy_error_files:
     enabled: false
     target_dir: "errors"  # Relative to output folder
+    
+  # PDF Handling Settings
+  pdf_handling:
+    copy_to_output: false # Copy existing PDF files from input to output folder
+
 
 pdf_settings:
   # Word Configuration Rules

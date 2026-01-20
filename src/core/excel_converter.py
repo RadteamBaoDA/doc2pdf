@@ -62,6 +62,11 @@ class ExcelConverter(Converter):
     DEFAULT_PAGE_HEIGHT_INCHES = 11.0
     POINTS_PER_INCH = 72
     
+    # Search Constants
+    xlByRows = 1
+    xlByColumns = 2
+    xlPrevious = 2
+    
     def convert(self, input_file: Path, output_file: Path, settings: PDFConversionSettings, on_progress: Optional[Callable[[float], None]] = None) -> None:
         """
         Convert Excel file to PDF using COM automation.
@@ -115,6 +120,10 @@ class ExcelConverter(Converter):
                         logger.warning(f"No visible sheets found in {input_file.name}")
                         raise ValueError(f"No visible sheets to export in {input_file.name}")
                     
+                    # Calculate progress weight per sheet
+                    total_sheets = len(sheets_to_export)
+                    sheet_weight = 1.0 / total_sheets if total_sheets > 0 else 0
+                    
                     # Apply page setup and process chunks
                     for sheet in sheets_to_export:
                         # Get sheet-specific settings
@@ -124,47 +133,51 @@ class ExcelConverter(Converter):
                         
                         logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
                         
+                        # Determine True Bounds (Last Col/Row with actual data)
+                        # This avoids issues where UsedRange is huge due to formatting
+                        last_row, last_col = self._get_true_used_bounds(sheet)
+                        last_col_alpha = self._col_num_to_letter(last_col)
+                        
                         # Check for Chunking
                         row_lim = sheet_excel_settings.row_dimensions
                         if row_lim and row_lim > 0:
                             # Chunking Mode
-                            used_rows = sheet.UsedRange.Rows.Count
-                            if used_rows == 0:
+                            # Use true last_row instead of UsedRange
+                            if last_row == 0:
+                                # Empty sheet
+                                if on_progress: on_progress(sheet_weight)
                                 continue
                                 
-                            chunks = (used_rows + row_lim - 1) // row_lim
+                            chunks = (last_row + row_lim - 1) // row_lim
                             logger.info(f"Splitting sheet '{sheet.Name}' into {chunks} chunks (Rows: {row_lim})")
                             
-                            chunk_fraction = 1.0 / chunks
+                            # Weight for each chunk
+                            chunk_weight = sheet_weight / chunks
+                            
                             for i in range(chunks):
                                 start_row = i * row_lim + 1
-                                end_row = min((i + 1) * row_lim, used_rows)
+                                end_row = min((i + 1) * row_lim, last_row)
                                 
                                 # Copy sheet to end
-                                # Use positional args for Copy: Copy(Before, After)
                                 last_sheet = workbook.Sheets(workbook.Sheets.Count)
                                 sheet.Copy(None, last_sheet)
                                 new_sheet = workbook.Sheets(workbook.Sheets.Count)
                                 
-                                # Rename removed to prevent errors
-                                
                                 temp_sheets_to_delete.append(new_sheet)
                                 
-                                # Set Print Area
-                                new_sheet.PageSetup.PrintArea = f"${start_row}:${end_row}"
+                                # Set Print Area explicitly to True content columns
+                                # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
+                                new_sheet.PageSetup.PrintArea = f"$A${start_row}:${last_col_alpha}${end_row}"
                                 
-                                # Create chunk settings (Force fit to 1 page tall for this chunk)
-                                # Cloning dataclass
+                                # Create chunk settings
                                 chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
                                 chunk_settings.row_dimensions = 0 # Force 1 page tall
                                 
-                                self._apply_page_setup(new_sheet, chunk_settings, input_file.name)
+                                self._apply_page_setup(new_sheet, chunk_settings, input_file.name, last_col)
 
-                                # Report progress
                                 if on_progress:
-                                    on_progress(chunk_fraction)
+                                    on_progress(chunk_weight)
                                 
-                                # Header
                                 if sheet_excel_settings.metadata_header:
                                     center_text = f"{start_row}-{end_row}"
                                     self._apply_metadata_header(new_sheet, sheet_excel_settings, input_file.name, center_text, left_text=sheet.Name)
@@ -172,10 +185,17 @@ class ExcelConverter(Converter):
                                 final_sheets_to_process.append(new_sheet)
                         else:
                             # Standard Mode
-                            self._apply_page_setup(sheet, sheet_excel_settings, input_file.name)
+                            # Set print area to avoid printing 1000 blank pages of formatting
+                            if last_row > 0:
+                                sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
+                            
+                            self._apply_page_setup(sheet, sheet_excel_settings, input_file.name, last_col)
                             if sheet_excel_settings.metadata_header:
                                 self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
                             final_sheets_to_process.append(sheet)
+                            
+                            if on_progress:
+                                on_progress(sheet_weight)
                     
                     # Export to PDF
                     if final_sheets_to_process:
@@ -312,35 +332,52 @@ class ExcelConverter(Converter):
     def _calculate_smart_page_size(
         self, 
         sheet, 
-        min_col_width_inches: float = 0.5
+        last_col_index: int
     ) -> Tuple[float, float]:
         """
-        Calculate page width to ensure OCR-readable text (14pt minimum).
+        Calculate page width based on actual column widths of used range.
         
         Args:
             sheet: Excel Worksheet object
-            min_col_width_inches: Minimum width per column for readable text
+            last_col_index: The 1-based index of the last used column (e.g. 5 for Column E)
             
         Returns:
             Tuple of (page_width_inches, page_height_inches)
         """
         try:
-            used_range = sheet.UsedRange
-            col_count = used_range.Columns.Count
+            if last_col_index < 1:
+                return self.MIN_PAGE_WIDTH_INCHES, self.DEFAULT_PAGE_HEIGHT_INCHES
+                
+            # Measure width of Range(A:LastCol)
+            # Range(sheet.Columns(1), sheet.Columns(last_col_index))
+            # Note: Columns(1) returns the entire column. 
+            # We want the width of the *columns* regardless of rows.
             
-            # Calculate minimum page width for readable text
-            min_page_width = col_count * min_col_width_inches
+            # Using Range(Cells(1,1), Cells(1, last_col_index)).Width? No, that's just First row width?
+            # Column width is property of column not cell usually?
+            # Range(...).Width returns width in points.
+            
+            first_col_char = "A"
+            last_col_char = self._col_num_to_letter(last_col_index)
+            col_range = sheet.Range(f"{first_col_char}1:{last_col_char}1")
+            
+            # .Width corresponds to the width in points of the range
+            content_width_points = col_range.Width
+            content_width_inches = content_width_points / self.POINTS_PER_INCH
+            
+            # Add a small buffer for margins (0.5 inch total)
+            page_width = content_width_inches + 0.5
             
             # Clamp to valid range
-            page_width = max(min_page_width, self.MIN_PAGE_WIDTH_INCHES)
+            page_width = max(page_width, self.MIN_PAGE_WIDTH_INCHES)
             page_width = min(page_width, self.MAX_PAGE_WIDTH_INCHES)
             
-            # Page height - use default or calculate based on row dimensions
+            # Page height - defaults
             page_height = self.DEFAULT_PAGE_HEIGHT_INCHES
             
             logger.debug(
-                f"Sheet '{sheet.Name}': {col_count} columns, "
-                f"page size: {page_width:.1f}\" x {page_height:.1f}\""
+                f"Sheet '{sheet.Name}' (Cols 1-{last_col_index}): "
+                f"Content Width: {content_width_inches:.2f}\" -> Page Width: {page_width:.2f}\""
             )
             
             return page_width, page_height
@@ -353,7 +390,8 @@ class ExcelConverter(Converter):
         self, 
         sheet, 
         excel_settings: ExcelSettings,
-        filename: str
+        filename: str,
+        last_col: int
     ) -> None:
         """
         Apply page setup settings for OCR-optimized PDF output.
@@ -362,6 +400,7 @@ class ExcelConverter(Converter):
             sheet: Excel Worksheet object
             excel_settings: Excel-specific settings
             filename: Original filename for header
+            last_col: Last used column index for width calculation
         """
         try:
             page_setup = sheet.PageSetup
@@ -369,7 +408,7 @@ class ExcelConverter(Converter):
             # Calculate smart page size
             page_width, page_height = self._calculate_smart_page_size(
                 sheet, 
-                excel_settings.min_col_width_inches
+                last_col
             )
             
             # Set orientation
@@ -429,10 +468,9 @@ class ExcelConverter(Converter):
             if not viable_sizes:
                 viable_sizes = [paper_ladder[-1]]  # Arch E
             
-            # Try sizes from largest to smallest (reverse order from viable list)
-            # This gives us the best chance of success with the printer
+            # Try sizes from smallest to largest to find the best fit that the printer supports
             paper_set_success = False
-            for (enum_val, width, name) in reversed(viable_sizes):
+            for (enum_val, width, name) in viable_sizes:
                 try:
                     page_setup.PaperSize = enum_val
                     # Verify if applied
@@ -566,6 +604,67 @@ class ExcelConverter(Converter):
             
         except Exception as e:
             logger.warning(f"Could not apply metadata header for '{sheet.Name}': {e}")
+
+    def _get_true_used_bounds(self, sheet) -> Tuple[int, int]:
+        """
+        Find the last row and column with actual data (ignoring empty formatting).
+        Returns (last_row_index, last_col_index).
+        """
+        try:
+            # Strategies for finding last cell
+            # 1. UsedRange (often overestimated)
+            # 2. Cells.Find("*", SearchOrder=xlByRows/xlByColumns, SearchDirection=xlPrevious)
+            
+            # Find Last Row
+            try:
+                # Find any non-empty cell, searching backwards from A1 (wrapping to end)
+                last_row_cell = sheet.Cells.Find(
+                    What="*",
+                    After=sheet.Range("A1"),
+                    LookIn=win32com.client.constants.xlValues if hasattr(win32com.client.constants, 'xlValues') else -4163, # xlValues
+                    LookAt=2, # xlPart
+                    SearchOrder=self.xlByRows,
+                    SearchDirection=self.xlPrevious
+                )
+                last_row = last_row_cell.Row if last_row_cell else 0
+            except Exception:
+                # Fallback to UsedRange if Find fails (e.g. empty sheet)
+                last_row = sheet.UsedRange.Rows.Count
+            
+            # Find Last Column
+            try:
+                last_col_cell = sheet.Cells.Find(
+                    What="*",
+                    After=sheet.Range("A1"),
+                    LookIn=win32com.client.constants.xlValues if hasattr(win32com.client.constants, 'xlValues') else -4163,
+                    LookAt=2,
+                    SearchOrder=self.xlByColumns,
+                    SearchDirection=self.xlPrevious
+                )
+                last_col = last_col_cell.Column if last_col_cell else 0
+            except Exception:
+                last_col = sheet.UsedRange.Columns.Count
+
+            # If find returned 0 but UsedRange has data, compare?
+            # Usually Find("*") returns None if sheet is purely empty.
+            if last_row == 0 and last_col == 0:
+                # Double check UsedRange count for safety? NO, if Find("*") fails, it's empty.
+                return 0, 0
+                
+            return last_row, last_col
+            
+        except Exception as e:
+            logger.warning(f"Error determining true bounds, falling back to UsedRange: {e}")
+            ur = sheet.UsedRange
+            return ur.Rows.Count, ur.Columns.Count
+
+    def _col_num_to_letter(self, n: int) -> str:
+        """Convert 1-based column number to Excel column letter (e.g. 1->A, 27->AA)."""
+        string = ""
+        while n > 0:
+            n, remainder = divmod(n - 1, 26)
+            string = chr(65 + remainder) + string
+        return string
 
     def _export_to_pdf(
         self, 

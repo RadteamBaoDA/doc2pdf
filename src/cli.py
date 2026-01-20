@@ -251,10 +251,14 @@ def convert(
                         progress.advance(task_id, advance=1)
                     
                     if converted_pdf and should_trim and converted_pdf.exists():
-                        try:
-                            pdf_processor.trim_whitespace(converted_pdf, margin=trim_margin_value)
-                        except Exception as trim_err:
-                            logger.warning(f"Failed to trim whitespace from {converted_pdf.name}: {trim_err}")
+                        # Check if file type is included in trim settings
+                        if file_type in post_proc_config.trim_whitespace.include:
+                            try:
+                                pdf_processor.trim_whitespace(converted_pdf, margin=trim_margin_value)
+                            except Exception as trim_err:
+                                logger.warning(f"Failed to trim whitespace from {converted_pdf.name}: {trim_err}")
+                        else:
+                            logger.debug(f"Skipping trim for {file_type} file: {file_path.name}")
                         
                 except Exception as e:
                     # Thread-safe counter update

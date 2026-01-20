@@ -12,17 +12,47 @@ from rich import box
 
 class LogBuffer:
     """Captures logs for display in the TUI."""
-    def __init__(self, maxlen=100):
+    def __init__(self, maxlen=1000): # Increased buffer
         self.queue = deque(maxlen=maxlen)
+        self.scroll_offset = 0
+        self.view_height = 20 # Approximate view height, adjustable
     
     def write(self, message: str):
         if message.strip():
              self.queue.append(message.strip())
+             # Auto-scroll if at bottom (offset 0)
+             if self.scroll_offset > 0:
+                 self.scroll_offset += 1
+
+    def scroll_up(self):
+        """Scroll up (view older logs)."""
+        if self.scroll_offset < len(self.queue) - self.view_height:
+            self.scroll_offset += 1
+
+    def scroll_down(self):
+        """Scroll down (view newer logs)."""
+        if self.scroll_offset > 0:
+            self.scroll_offset -= 1
 
     def get_renderable(self) -> RenderableType:
+        # Calculate slice
+        total = len(self.queue)
+        if total == 0:
+            text = ""
+        else:
+            if self.scroll_offset == 0:
+                # Show latest
+                visible = list(self.queue)[-self.view_height:]
+            else:
+                # Show history
+                end = total - self.scroll_offset
+                start = max(0, end - self.view_height)
+                visible = list(self.queue)[start:end]
+            text = "\n".join(visible)
+            
         return Panel(
-            Text.from_markup("\n".join(self.queue)),
-            title="Application Logs",
+            Text.from_markup(text),
+            title=f"Application Logs {'(SCROLLED)' if self.scroll_offset > 0 else ''}",
             border_style="blue",
             box=box.ROUNDED
         )

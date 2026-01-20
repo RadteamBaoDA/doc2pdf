@@ -9,7 +9,7 @@ Features:
 """
 import sys
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Literal, Callable
 import win32com.client
 import win32print
 import pythoncom
@@ -58,41 +58,33 @@ class ExcelConverter(Converter):
     DEFAULT_PAGE_HEIGHT_INCHES = 11.0
     POINTS_PER_INCH = 72
     
-    def convert(
-        self, 
-        input_path: Path, 
-        output_path: Optional[Path] = None, 
-        settings: Optional[PDFConversionSettings] = None
-    ) -> Path:
+    def convert(self, input_file: Path, output_file: Path, settings: PDFConversionSettings, on_progress: Optional[Callable[[float], None]] = None) -> None:
         """
-        Convert an Excel document to PDF.
+        Convert Excel file to PDF using COM automation.
         
         Args:
-            input_path: Path to the source Excel file.
-            output_path: Optional path for the output PDF.
-            settings: PDF conversion settings.
-            
-        Returns:
-            Path to the generated PDF file.
-        """
-        input_file = input_path.resolve()
+            input_file: Path to source Excel file
+            output_file: Path to destination PDF file
+            settings: PDFConversionSettings object containing conversion configuration
+            on_progress: Optional callback for partial progress (0.0 to 1.0)
+        """    
+        input_file = input_file.resolve()
         if not input_file.exists():
             raise FileNotFoundError(f"Input file not found: {input_file}")
             
-        if output_path:
-            out_file = output_path.resolve()
+        if output_file:
+            out_file = output_file.resolve()
         else:
             out_file = input_file.with_suffix(".pdf")
             
         # Ensure output directory exists
         out_file.parent.mkdir(parents=True, exist_ok=True)
             
-        settings = settings or PDFConversionSettings()
+        # settings is PDFConversionSettings
         excel_settings = settings.excel or ExcelSettings()
         
         logger.info(f"Converting '{input_file.name}' to PDF...")
         logger.debug(f"Settings: {settings}")
-        logger.debug(f"Excel settings: {excel_settings}")
 
         # Ensure CoInitialize is called for this thread
         pythoncom.CoInitialize()
@@ -100,6 +92,9 @@ class ExcelConverter(Converter):
         try:
             with self._excel_application() as excel:
                 workbook = None
+                temp_sheets_to_delete = []
+                final_sheets_to_process = []
+                
                 try:
                     # Open Workbook (ReadOnly for safety)
                     workbook = excel.Workbooks.Open(
@@ -115,9 +110,6 @@ class ExcelConverter(Converter):
                     if not sheets_to_export:
                         logger.warning(f"No visible sheets found in {input_file.name}")
                         raise ValueError(f"No visible sheets to export in {input_file.name}")
-                    
-                    final_sheets_to_process = []
-                    temp_sheets_to_delete = []
                     
                     # Apply page setup and process chunks
                     for sheet in sheets_to_export:
@@ -139,6 +131,7 @@ class ExcelConverter(Converter):
                             chunks = (used_rows + row_lim - 1) // row_lim
                             logger.info(f"Splitting sheet '{sheet.Name}' into {chunks} chunks (Rows: {row_lim})")
                             
+                            chunk_fraction = 1.0 / chunks
                             for i in range(chunks):
                                 start_row = i * row_lim + 1
                                 end_row = min((i + 1) * row_lim, used_rows)
@@ -162,6 +155,10 @@ class ExcelConverter(Converter):
                                 chunk_settings.row_dimensions = 0 # Force 1 page tall
                                 
                                 self._apply_page_setup(new_sheet, chunk_settings, input_file.name)
+
+                                # Report progress
+                                if on_progress:
+                                    on_progress(chunk_fraction)
                                 
                                 # Header
                                 if sheet_excel_settings.metadata_header:

@@ -22,8 +22,9 @@ from .version import __version__
 from .core.word_converter import WordConverter
 from .core.powerpoint_converter import PowerPointConverter
 from .core.excel_converter import ExcelConverter
+from .core.pdf_processor import PDFProcessor
 from .utils.logger import setup_logger, logger
-from .config import get_logging_config, get_pdf_settings, get_suffix_config, get_reporting_config, FileType
+from .config import get_logging_config, get_pdf_settings, get_suffix_config, get_reporting_config, get_post_processing_config, FileType
 
 app = typer.Typer(
     name="doc2pdf",
@@ -99,6 +100,8 @@ def convert(
     input_path: Path = typer.Argument(Path("input"), help="Path to the input file or directory", exists=True),
     output_path: Optional[Path] = typer.Option(Path("output"), "--output", "-o", help="Path to the output PDF or Directory"),
     verbose: bool = typer.Option(False, "--verbose", help="Enable verbose logging"),
+    trim: Optional[bool] = typer.Option(None, "--trim/--no-trim", help="Trim whitespace from output PDF (overrides config.yml)"),
+    trim_margin: Optional[float] = typer.Option(None, "--trim-margin", help="Margin in points when trimming (default: 10)"),
 ):
     """
     Convert a document or a directory of documents to PDF.
@@ -114,7 +117,9 @@ def convert(
     current_config = config.copy()
     if verbose:
         current_config["level"] = "DEBUG"
-    setup_logger(current_config)
+    
+    # Capture console handler ID to remove it later during TUI to prevent flashing
+    console_handler_id = setup_logger(current_config)
 
     files = get_files(input_path)
     
@@ -126,11 +131,18 @@ def convert(
     word_converter = WordConverter()
     ppt_converter = PowerPointConverter()
     excel_converter = ExcelConverter()
+    pdf_processor = PDFProcessor()
+    
+    # Get post-processing settings (CLI overrides config)
+    post_proc_config = get_post_processing_config()
+    should_trim = trim if trim is not None else post_proc_config.trim_whitespace.enabled
+    trim_margin_value = trim_margin if trim_margin is not None else post_proc_config.trim_whitespace.margin
 
     # TUI Setup
     from .tui import LogBuffer, TUIContext
     
     log_buffer = LogBuffer()
+    tui_ctx = TUIContext(log_buffer)
     
     # Redirect Logger to TUI Buffer
     def tui_sink(message):
@@ -149,14 +161,22 @@ def convert(
         
         log_msg = f"[{color}]{record['time'].strftime('%H:%M:%S')} | {level_name: <8} | {record['message']}[/{color}]"
         log_buffer.write(log_msg)
+        
+        # Trigger explicit update for realtime logs
+        tui_ctx.update_logs()
     
     # Add TUI sink
     try:
-        logger.add(tui_sink, format="{message}", level="INFO")
+        # Use configured level so verbose logs appear in TUI
+        tui_level = current_config.get("level", "INFO")
+        logger.add(tui_sink, format="{message}", level=tui_level)
+        
+        # Remove default console handler to prevent flashing (stderr interference)
+        if console_handler_id is not None:
+            logger.remove(console_handler_id)
+            
     except Exception:
-        pass 
-
-    tui_ctx = TUIContext(log_buffer)
+        pass
 
     # Initialize Progress (passive)
     progress = Progress(
@@ -217,11 +237,17 @@ def convert(
                     def progress_callback(amount: float):
                         progress.advance(task_id, advance=amount)
                     
+                    converted_pdf = None
+                    
                     if file_type == "word":
                         word_converter.convert(file_path, target_file, settings)
+                        converted_pdf = target_file
+                        success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "powerpoint":
                         ppt_converter.convert(file_path, target_file, settings)
+                        converted_pdf = target_file
+                        success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "excel":
                         # Excel converter handles its own progress if callback provided
@@ -238,6 +264,7 @@ def convert(
                         # Or safer: Pass callback. If callback was called, good.
                         # But simpler: converter advances 1.0 TOTAL.
                         excel_converter.convert(file_path, target_file, settings, on_progress=progress_callback)
+                        converted_pdf = target_file
                         # If the converter didn't chunk, it wouldn't have called progress_callback.
                         # We should check if we need to force complete.
                         # But 'convert' is blocking. When it returns, the file is DONE.
@@ -249,6 +276,13 @@ def convert(
                         logger.warning(f"Conversion for {file_type} not supported. Skipping {file_path.name}")
                         skipped_count += 1
                         progress.advance(task_id, advance=1)
+                    
+                    # Post-processing: Trim whitespace if enabled
+                    if converted_pdf and should_trim and converted_pdf.exists():
+                        try:
+                            pdf_processor.trim_whitespace(converted_pdf, margin=trim_margin_value)
+                        except Exception as trim_err:
+                            logger.warning(f"Failed to trim whitespace from {converted_pdf.name}: {trim_err}")
                         
                 except Exception as e:
                     fail_count += 1

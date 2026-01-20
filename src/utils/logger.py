@@ -3,7 +3,7 @@ from loguru import logger
 from pathlib import Path
 from typing import Optional
 
-def setup_logger(config: Optional[dict] = None) -> None:
+def setup_logger(config: Optional[dict] = None) -> Optional[int]:
     """
     Configure the application logger using loguru.
     
@@ -20,13 +20,16 @@ def setup_logger(config: Optional[dict] = None) -> None:
 
     level = config.get("level", "INFO")
     
+    console_handler_id = None
     # Console Handler
     if config.get("console", True):
-        logger.add(
+        console_handler_id = logger.add(
             sys.stderr, 
             level=config.get("level", "INFO"), # Use the general level for console if not specified otherwise
             format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
         )
+    
+    return console_handler_id
 
     # File Handler
     file_config = config.get("file", {})

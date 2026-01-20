@@ -1,11 +1,19 @@
 logging:
-  level: INFO
+  level: DEBUG
   console: true
   file:
     enabled: true
     path: "logs/doc2pdf_{time:YYYYMMDDHHmmss}.log"
     rotation: "10 MB"
     retention: "10 days"
+
+# PDF Post-Processing
+post_processing:
+  # Auto-trim whitespace from PDF output
+  trim_whitespace:
+    enabled: false  # Set to true to enable by default
+    margin: 10      # Points (1/72 inch) of padding around content
+
 
 # PDF filename suffix per document type
 suffix:

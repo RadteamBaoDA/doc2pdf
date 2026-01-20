@@ -550,13 +550,12 @@ class ExcelConverter(Converter):
             # Center header: Custom text (Row range) or empty
             page_setup.CenterHeader = center_text
             
-            # Right header: Filename
-            page_setup.RightHeader = filename
+            # Right header: Filename + Page Number
+            # Format: filename (Page X)
+            page_setup.RightHeader = f"{filename} (Page &P)"
             
-            # Right Footer: Page Number
-            page_setup.RightFooter = "Page &P"
-            
-            # Clear other footers to avoid clutter
+            # Clear footers to avoid clutter and potential crop issues
+            page_setup.RightFooter = ""
             page_setup.CenterFooter = ""
             page_setup.LeftFooter = ""
             

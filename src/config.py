@@ -9,6 +9,28 @@ CONFIG_FILE = Path("config.yml")
 # Supported file types
 FileType = Literal["word", "excel", "powerpoint"]
 
+
+@dataclass
+class TrimWhitespaceSettings:
+    """Settings for PDF whitespace trimming."""
+    enabled: bool = False
+    margin: float = 10.0  # Points (1/72 inch) of padding around content
+
+
+@dataclass
+class PostProcessingSettings:
+    """PDF post-processing settings."""
+    trim_whitespace: TrimWhitespaceSettings = field(default_factory=TrimWhitespaceSettings)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PostProcessingSettings":
+        """Create PostProcessingSettings from dictionary."""
+        trim_data = data.get("trim_whitespace", {})
+        return cls(
+            trim_whitespace=TrimWhitespaceSettings(**trim_data) if trim_data else TrimWhitespaceSettings()
+        )
+
+
 @dataclass
 class LayoutSettings:
     orientation: str = "portrait"
@@ -202,6 +224,23 @@ def get_reporting_config() -> ReportingSettings:
         return ReportingSettings()
     
     return ReportingSettings.from_dict(reporting_data)
+
+
+def get_post_processing_config() -> PostProcessingSettings:
+    """
+    Get post-processing configuration with defaults.
+    
+    Returns:
+        PostProcessingSettings object with trim_whitespace settings.
+    """
+    config = load_config()
+    post_proc_data = config.get("post_processing", {})
+    
+    if not post_proc_data:
+        return PostProcessingSettings()
+    
+    return PostProcessingSettings.from_dict(post_proc_data)
+
 
 def _merge_dict(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
     """Deep merge two dictionaries."""

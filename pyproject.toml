@@ -24,6 +24,8 @@ dependencies = [
     "loguru>=0.7.0",
     "pyyaml>=6.0.0",
     "pywin32>=306",
+    "pypdf>=3.0.0",
+    "pdfminer.six>=20221105",
 ]
 
 [project.scripts]

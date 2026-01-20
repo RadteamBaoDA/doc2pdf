@@ -1,11 +1,45 @@
 logging:
-  level: INFO
+  level: DEBUG
   console: true
   file:
     enabled: true
     path: "logs/doc2pdf_{time:YYYYMMDDHHmmss}.log"
     rotation: "10 MB"
     retention: "10 days"
+
+# PDF Post-Processing
+post_processing:
+  # Auto-trim whitespace from PDF output
+  trim_whitespace:
+    enabled: false  # Set to true to enable by default
+    margin: 10      # Points (1/72 inch) of padding around content
+
+
+# PDF filename suffix per document type
+suffix:
+  word: "_d"
+  powerpoint: "_p"
+  excel: "_x"
+
+# Reporting and Error Handling
+reporting:
+  enabled: true
+  reports_dir: "reports"
+  
+  # Summary report with conversion statistics
+  summary:
+    enabled: true
+    format: "summary_{timestamp}.txt"  # {timestamp} = YYYYMMDDHHmmss
+  
+  # Error file listing (failed files with FULL input/output paths for tracing)
+  error_log:
+    enabled: true
+    format: "error_{timestamp}.txt"
+  
+  # Copy failed source files to a separate folder (optional, disabled by default)
+  copy_error_files:
+    enabled: false
+    target_dir: "errors"  # Relative to output folder
 
 pdf_settings:
   # Word Configuration Rules
@@ -41,24 +75,30 @@ pdf_settings:
       settings:
         bookmarks: "bookmarks"
 
-  # Excel Configuration Rules
+  # Excel Configuration Rules (by sheet_name pattern)
   excel:
-    - pattern: "*"
+    # Default rule for all sheets
+    - sheet_name: "*"
       priority: 10
       settings:
-        scope: "all"
-        layout:
-          orientation: "landscape"
-          pages_per_sheet: 1
-          margins: "normal"
-        metadata:
-          include_properties: true
-          include_tags: true
-        bookmarks: "none"
-        compliance: "pdfa"
-        optimization:
-          image_quality: "high"
-          bitmap_text: false
+        orientation: "landscape"
+        row_dimensions: 10  # null=auto, 0=fit all on one page, N=fixed rows
+        metadata_header: true
+        min_col_width_inches: 0.5
+
+    # Example: Summary sheets fit on one page
+    - sheet_name: "*Summary*"
+      priority: 50
+      settings:
+        excel:
+          row_dimensions: 0  # Fit all on one page
+
+    # Example: Data sheets with fixed rows per page
+    - sheet_name: "*Data*"
+      priority: 50
+      settings:
+        excel:
+          row_dimensions: 10  # 50 rows per page
 
   # PowerPoint Configuration Rules
   powerpoint:

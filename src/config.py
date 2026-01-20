@@ -42,6 +42,48 @@ class ExcelSettings:
     min_col_width_inches: float = 0.5  # Minimum column width for OCR-readable 14pt text
 
 @dataclass
+class SummaryReportSettings:
+    """Summary report settings."""
+    enabled: bool = True
+    format: str = "summary_{timestamp}.txt"
+
+@dataclass
+class ErrorLogSettings:
+    """Error log file settings."""
+    enabled: bool = True
+    format: str = "error_{timestamp}.txt"
+
+@dataclass
+class CopyErrorFilesSettings:
+    """Settings for copying failed source files."""
+    enabled: bool = True
+    target_dir: str = "errors"
+
+@dataclass
+class ReportingSettings:
+    """Reporting and error handling settings."""
+    enabled: bool = True
+    reports_dir: str = "reports"
+    summary: SummaryReportSettings = field(default_factory=SummaryReportSettings)
+    error_log: ErrorLogSettings = field(default_factory=ErrorLogSettings)
+    copy_error_files: CopyErrorFilesSettings = field(default_factory=CopyErrorFilesSettings)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ReportingSettings":
+        """Create ReportingSettings from dictionary."""
+        summary_data = data.get("summary", {})
+        error_log_data = data.get("error_log", {})
+        copy_error_data = data.get("copy_error_files", {})
+        
+        return cls(
+            enabled=data.get("enabled", True),
+            reports_dir=data.get("reports_dir", "reports"),
+            summary=SummaryReportSettings(**summary_data) if summary_data else SummaryReportSettings(),
+            error_log=ErrorLogSettings(**error_log_data) if error_log_data else ErrorLogSettings(),
+            copy_error_files=CopyErrorFilesSettings(**copy_error_data) if copy_error_data else CopyErrorFilesSettings(),
+        )
+
+@dataclass
 class PDFConversionSettings:
     scope: str = "all"
     layout: LayoutSettings = field(default_factory=LayoutSettings)
@@ -145,6 +187,21 @@ def get_suffix_config() -> Dict[str, str]:
     
     defaults.update(suffix_config)
     return defaults
+
+def get_reporting_config() -> ReportingSettings:
+    """
+    Get reporting configuration with defaults.
+    
+    Returns:
+        ReportingSettings object with summary, error_log, and copy_error_files settings.
+    """
+    config = load_config()
+    reporting_data = config.get("reporting", {})
+    
+    if not reporting_data:
+        return ReportingSettings()
+    
+    return ReportingSettings.from_dict(reporting_data)
 
 def _merge_dict(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
     """Deep merge two dictionaries."""

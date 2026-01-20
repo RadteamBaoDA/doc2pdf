@@ -1,8 +1,10 @@
 import typer
 import sys
 import time
+import shutil
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
@@ -21,7 +23,7 @@ from .core.word_converter import WordConverter
 from .core.powerpoint_converter import PowerPointConverter
 from .core.excel_converter import ExcelConverter
 from .utils.logger import setup_logger, logger
-from .config import get_logging_config, get_pdf_settings, get_suffix_config, FileType
+from .config import get_logging_config, get_pdf_settings, get_suffix_config, get_reporting_config, FileType
 
 app = typer.Typer(
     name="doc2pdf",
@@ -175,6 +177,7 @@ def convert(
             success_count = 0
             fail_count = 0
             skipped_count = 0
+            failed_files: List[Tuple[Path, Path, str]] = []  # (input, output, error)
             
             tui_ctx.update_progress(progress) # Initial render
             
@@ -249,10 +252,10 @@ def convert(
                         
                 except Exception as e:
                     fail_count += 1
+                    failed_files.append((file_path, target_file, str(e)))
                     logger.error(f"Failed to convert {file_path}: {e}")
-                    # If failed, we still need to advance to keep counter correct?
-                    # Yes, file is "processed" (failed).
-                    progress.advance(task_id, advance=1) # May overfill if partials were reported?
+                    # If failed, we still need to advance to keep counter correct
+                    progress.advance(task_id, advance=1)
                 
                 # Ensure we are exactly at the next integer step (M of N count relies on completed tasks)
                 # If we used partials, we might be at 3.99.
@@ -301,6 +304,57 @@ def convert(
     
     console.print(table)
     console.print(f"Logs available in: [bold]{current_config['file'].get('path', 'logs/')}[/bold]")
+    
+    # Generate reports if enabled
+    reporting_config = get_reporting_config()
+    if reporting_config.enabled:
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        reports_dir = Path(reporting_config.reports_dir)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Summary report
+        if reporting_config.summary.enabled:
+            summary_filename = reporting_config.summary.format.replace("{timestamp}", timestamp)
+            summary_path = reports_dir / summary_filename
+            with open(summary_path, "w", encoding="utf-8") as f:
+                f.write(f"doc2pdf Conversion Summary\n")
+                f.write(f"{'='*50}\n")
+                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Input: {input_path}\n")
+                f.write(f"Output: {output_path}\n\n")
+                f.write(f"Results:\n")
+                f.write(f"  Success: {success_count}\n")
+                f.write(f"  Failed:  {fail_count}\n")
+                f.write(f"  Skipped: {skipped_count}\n")
+                f.write(f"  Total:   {len(files)}\n")
+            console.print(f"Summary report: [bold]{summary_path}[/bold]")
+        
+        # Error log with file paths
+        if reporting_config.error_log.enabled and failed_files:
+            error_filename = reporting_config.error_log.format.replace("{timestamp}", timestamp)
+            error_path = reports_dir / error_filename
+            with open(error_path, "w", encoding="utf-8") as f:
+                f.write(f"doc2pdf Error Report\n")
+                f.write(f"{'='*50}\n")
+                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                for i, (input_file, output_file, error_msg) in enumerate(failed_files, 1):
+                    f.write(f"[{i}] {input_file.name}\n")
+                    f.write(f"    Input:  {input_file}\n")
+                    f.write(f"    Output: {output_file}\n")
+                    f.write(f"    Error:  {error_msg}\n\n")
+            console.print(f"Error report: [bold]{error_path}[/bold]")
+        
+        # Copy error files to separate folder
+        if reporting_config.copy_error_files.enabled and failed_files:
+            errors_dir = output_path / reporting_config.copy_error_files.target_dir
+            errors_dir.mkdir(parents=True, exist_ok=True)
+            for input_file, _, _ in failed_files:
+                try:
+                    dest = errors_dir / input_file.name
+                    shutil.copy2(input_file, dest)
+                except Exception as copy_err:
+                    logger.warning(f"Could not copy error file {input_file.name}: {copy_err}")
+            console.print(f"Error files copied to: [bold]{errors_dir}[/bold]")
     
 if __name__ == "__main__":
     app()

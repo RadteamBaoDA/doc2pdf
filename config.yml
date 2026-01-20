@@ -13,6 +13,26 @@ suffix:
   powerpoint: "_p"
   excel: "_x"
 
+# Reporting and Error Handling
+reporting:
+  enabled: true
+  reports_dir: "reports"
+  
+  # Summary report with conversion statistics
+  summary:
+    enabled: true
+    format: "summary_{timestamp}.txt"  # {timestamp} = YYYYMMDDHHmmss
+  
+  # Error file listing (failed files with FULL input/output paths for tracing)
+  error_log:
+    enabled: true
+    format: "error_{timestamp}.txt"
+  
+  # Copy failed source files to a separate folder (optional, disabled by default)
+  copy_error_files:
+    enabled: false
+    target_dir: "errors"  # Relative to output folder
+
 pdf_settings:
   # Word Configuration Rules
   word:

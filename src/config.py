@@ -15,6 +15,7 @@ class TrimWhitespaceSettings:
     """Settings for PDF whitespace trimming."""
     enabled: bool = False
     margin: float = 10.0  # Points (1/72 inch) of padding around content
+    include: List[str] = field(default_factory=lambda: ["word", "excel", "powerpoint"])
 
 
 @dataclass
@@ -129,7 +130,8 @@ class PDFConversionSettings:
         # Also check for top-level excel settings (flat structure)
         top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "min_col_width_inches", "sheet_name"]
         for key in top_level_excel_keys:
-            if key in data and key not in excel_data:
+            if key in data:
+                # Top-level (flat) settings override nested 'excel' settings
                 excel_data[key] = data[key]
         
         return cls(

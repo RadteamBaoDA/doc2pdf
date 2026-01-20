@@ -11,8 +11,9 @@ logging:
 post_processing:
   # Auto-trim whitespace from PDF output
   trim_whitespace:
-    enabled: false  # Set to true to enable by default
+    enabled: true  # Set to true to enable by default
     margin: 10      # Points (1/72 inch) of padding around content
+    include: ["excel"] # File types to apply trim to "word", "powerpoint"
 
 
 # PDF filename suffix per document type

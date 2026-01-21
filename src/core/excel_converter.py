@@ -128,8 +128,8 @@ class ExcelConverter(Converter):
                     # Apply page setup and process chunks
                     for sheet in sheets_to_export:
                         # Get sheet-specific settings
-                        # Note: Arguments are (sheet_name, settings)
-                        sheet_settings = get_excel_sheet_settings(sheet.Name, settings)
+                        # Note: Arguments are (sheet_name, base_settings, input_path)
+                        sheet_settings = get_excel_sheet_settings(sheet.Name, settings, input_file)
                         sheet_excel_settings = sheet_settings.excel or excel_settings
                         
                         logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
@@ -659,6 +659,22 @@ class ExcelConverter(Converter):
                 # Double check UsedRange count for safety? NO, if Find("*") fails, it's empty.
                 return 0, 0
                 
+            # Check for Shapes/Objects (Images, Charts, etc.)
+            try:
+                for shape in sheet.Shapes:
+                    try:
+                        # Get bottom-right cell of the shape
+                        br_cell = shape.BottomRightCell
+                        if br_cell:
+                            last_row = max(last_row, br_cell.Row)
+                            last_col = max(last_col, br_cell.Column)
+                            logger.debug(f"Shape '{shape.Name}' extends bounds to Row {br_cell.Row}, Col {br_cell.Column}")
+                    except Exception:
+                        # Some shapes might not avail BottomRightCell (e.g. comments sometimes)
+                        continue
+            except Exception as e:
+                logger.warning(f"Failed to check shapes for bounds detection: {e}")
+
             return last_row, last_col
             
         except Exception as e:

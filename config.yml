@@ -104,7 +104,21 @@ pdf_settings:
       priority: 50
       settings:
         excel:
+    # Example: Data sheets with fixed rows per page
+    - sheet_name: "*Data*"
+      priority: 50
+      settings:
+        excel:
           row_dimensions: 10  # 50 rows per page
+
+    # Example: Folder-based override (e.g. "Confidential" folder)
+    - pattern: "*Confidential*"  # Matches file path
+      sheet_name: "*"            # Matches all sheets in those files
+      priority: 100
+      settings:
+        excel:
+          metadata_header: false
+          orientation: "portrait"
 
   # PowerPoint Configuration Rules
   powerpoint:

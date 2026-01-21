@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from .base import Converter
 from ..config import PDFConversionSettings, ExcelSettings, get_excel_sheet_settings
 from ..utils.logger import logger
+from ..utils.process_manager import ProcessRegistry
 
 # Excel constants from Object Model
 xlTypePDF = 0
@@ -237,12 +238,14 @@ class ExcelConverter(Converter):
             # Try to set optimal printer
             self._set_optimal_printer(excel)
             
+            ProcessRegistry.register(excel)
             yield excel
         except Exception as e:
             logger.critical(f"Failed to initialize Microsoft Excel: {e}")
             raise
         finally:
             if excel:
+                ProcessRegistry.unregister(excel)
                 excel.Quit()
 
     def _set_optimal_printer(self, excel) -> None:
@@ -349,13 +352,7 @@ class ExcelConverter(Converter):
                 return self.MIN_PAGE_WIDTH_INCHES, self.DEFAULT_PAGE_HEIGHT_INCHES
                 
             # Measure width of Range(A:LastCol)
-            # Range(sheet.Columns(1), sheet.Columns(last_col_index))
-            # Note: Columns(1) returns the entire column. 
-            # We want the width of the *columns* regardless of rows.
-            
-            # Using Range(Cells(1,1), Cells(1, last_col_index)).Width? No, that's just First row width?
-            # Column width is property of column not cell usually?
-            # Range(...).Width returns width in points.
+            # content_width_points = range.Width
             
             first_col_char = "A"
             last_col_char = self._col_num_to_letter(last_col_index)
@@ -368,16 +365,12 @@ class ExcelConverter(Converter):
             # Add a small buffer for margins (0.5 inch total)
             page_width = content_width_inches + 0.5
             
-            # Clamp to valid range
-            page_width = max(page_width, self.MIN_PAGE_WIDTH_INCHES)
-            page_width = min(page_width, self.MAX_PAGE_WIDTH_INCHES)
-            
             # Page height - defaults
             page_height = self.DEFAULT_PAGE_HEIGHT_INCHES
             
             logger.debug(
                 f"Sheet '{sheet.Name}' (Cols 1-{last_col_index}): "
-                f"Content Width: {content_width_inches:.2f}\" -> Page Width: {page_width:.2f}\""
+                f"Content Width: {content_width_inches:.2f}\" -> Page Width (w/ margins): {page_width:.2f}\""
             )
             
             return page_width, page_height
@@ -412,145 +405,160 @@ class ExcelConverter(Converter):
             )
             
             # Set orientation
-            if excel_settings.orientation.lower() == "portrait":
+            # If width > 8.5 OR explicitly set to landscape, try landscape.
+            # But normally we auto-detect orientation based on width ratio?
+            # For now, stick to settings or default to portrait if narrow, landscape if wide?
+            # User requirement: "base on current size of sheet choose page size"
+            
+            # Force orientation based on content?
+            # If content is wider than 8.5 but less than 11, Landscape Letter is better than Portrait Letter?
+            # Let's trust the settings or default to Portrait unless it's very wide.
+            
+            if excel_settings.orientation.lower() == "landscape":
+                page_setup.Orientation = xlLandscape
+            elif excel_settings.orientation.lower() == "portrait":
                 page_setup.Orientation = xlPortrait
             else:
-                page_setup.Orientation = xlLandscape
-            
-            # Smart Paper Size Selection
+                 # Auto orientation
+                 if page_width > 8.5:
+                     page_setup.Orientation = xlLandscape
+                 else:
+                     page_setup.Orientation = xlPortrait
+
             is_landscape = (page_setup.Orientation == xlLandscape)
             
-            # Define ladder of supported sizes (Enum, Landscape Width inches, Name)
-            # Arch sizes require Microsoft Print to PDF or similar virtual printer.
-            # The iterative selection will fall back if printer rejects larger sizes.
-            # Paper sizes sorted by landscape width (smallest to largest)
-            # Format: (Enum, Landscape Width in inches, Name)
-            paper_ladder = [
-                (xlPaperLetter, 11.0, "Letter"),        # 8.5x11
-                (xlPaperB4, 13.9, "B4"),                # 9.84x13.9
-                (xlPaperLegal, 14.0, "Legal"),          # 8.5x14
-                (xlPaperA3, 16.54, "A3"),               # 11.69x16.54
-                (xlPaperTabloid, 17.0, "Tabloid"),      # 11x17
-                (xlPaperB3, 19.69, "B3"),               # 13.9x19.69
-                (xlPaperC, 22.0, "Arch C"),             # 17x22
-                (xlPaperA2, 23.39, "A2"),               # 16.54x23.39
-                (xlPaperD, 34.0, "Arch D"),             # 22x34
-                (xlPaperE, 44.0, "Arch E"),             # 34x44
-            ]
+            # Define ladder of supported sizes
+            # Format: (Enum, WidthLimit (inches), Name)
+            # WidthLimit: The maximum content width this paper size can effectively hold (considering margins/orientation)
             
-            if not is_landscape:
-                # Portrait widths
+            # Standard sizes only first? Or mix?
+            # Lets define physically available constraints.
+            
+            if is_landscape:
+                # Width is the longer dimension
+                 paper_ladder = [
+                    (xlPaperLetter, 11.0, "Letter"),        # 11 wide
+                    (xlPaperLegal, 14.0, "Legal"),          # 14 wide
+                    (xlPaperA3, 16.54, "A3"),               # 16.54 wide
+                    (xlPaperTabloid, 17.0, "Tabloid"),      # 17 wide
+                    (xlPaperA2, 23.39, "A2"),               # 23.39 wide
+                    (xlPaperD, 34.0, "Arch D"),             # 34 wide
+                    (xlPaperE, 44.0, "Arch E"),             # 44 wide
+                ]
+            else:
+                # Width is the shorter dimension
                 paper_ladder = [
-                    (xlPaperLetter, 8.5, "Letter"),
-                    (xlPaperLegal, 8.5, "Legal"),
-                    (xlPaperB4, 9.84, "B4"),
-                    (xlPaperTabloid, 11.0, "Tabloid"),
-                    (xlPaperA3, 11.69, "A3"),
-                    (xlPaperB3, 13.9, "B3"),
-                    (xlPaperA2, 16.54, "A2"),
-                    (xlPaperC, 17.0, "Arch C"),
-                    (xlPaperD, 22.0, "Arch D"),
-                    (xlPaperE, 34.0, "Arch E"),
+                    (xlPaperLetter, 8.5, "Letter"),         # 8.5 wide
+                    (xlPaperLegal, 8.5, "Legal"),           # 8.5 wide (Legal is just taller)
+                    (xlPaperA3, 11.69, "A3"),               # 11.69 wide
+                    (xlPaperTabloid, 11.0, "Tabloid"),      # 11 wide
+                    (xlPaperA2, 16.54, "A2"),               # 16.54 wide
+                    (xlPaperD, 22.0, "Arch D"),             # 22, wide
+                    (xlPaperE, 34.0, "Arch E"),             # 34 wide
                 ]
 
-            selected_paper = xlPaperLetter
-            available_width = 11.0 if is_landscape else 8.5
-            selected_name = "Letter"
+            selected_paper = None
+            selected_name = None
+            limit_width = 8.5
             
-            # Find all paper sizes that can fit the content (smallest first)
-            # Then we'll try from largest to smallest until one works with the printer
-            viable_sizes = []
-            for (enum_val, width, name) in paper_ladder:
-                if page_width <= width:
-                    viable_sizes.append((enum_val, width, name))
+            # 1. Find the Smallest Fit and fallback candidates
+            candidates = []
+            best_fit_index = -1
             
-            # If content is wider than all sizes, use the largest available
-            if not viable_sizes:
-                viable_sizes = [paper_ladder[-1]]  # Arch E
+            # Find the index of the first size that fits
+            for i, (enum_val, width_limit, name) in enumerate(paper_ladder):
+                if width_limit >= page_width:
+                    best_fit_index = i
+                    break
             
-            # Try sizes from smallest to largest to find the best fit that the printer supports
-            paper_set_success = False
-            for (enum_val, width, name) in viable_sizes:
+            if best_fit_index != -1:
+                # Try all sizes from best fit upwards
+                candidates = paper_ladder[best_fit_index:]
+            else:
+                # Content exceeds all standard sizes, try the largest one
+                candidates = [paper_ladder[-1]]
+                oversized = True
+            
+            # 2. Try to set valid paper size
+            for (enum_to_try, limit_to_try, name_to_try) in candidates:
                 try:
-                    page_setup.PaperSize = enum_val
-                    # Verify if applied
-                    current_size = page_setup.PaperSize
-                    if current_size == enum_val:
-                        selected_paper = enum_val
-                        available_width = width
-                        selected_name = name
+                    page_setup.PaperSize = enum_to_try
+                    # Verify
+                    if page_setup.PaperSize == enum_to_try:
+                        selected_paper = enum_to_try
+                        selected_name = name_to_try
+                        limit_width = limit_to_try
+                        logger.info(f"Selected paper size: {selected_name} for width {page_width:.2f}\"")
                         paper_set_success = True
                         break
                     else:
-                        logger.debug(f"Printer rejected {name} (Enum {enum_val}), trying next size...")
+                        logger.debug(f"Printer rejected paper size {name_to_try} (Enum {enum_to_try}). Trying next larger size...")
                 except Exception as e:
-                    logger.debug(f"Failed to set paper size {name}: {e}")
+                    logger.debug(f"Failed to set paper size to {name_to_try}: {e}")
                     continue
             
             if not paper_set_success:
-                # All sizes failed, use whatever the printer defaulted to
-                logger.warning(f"Could not set any large paper size. Using printer default.")
-                # Estimate width based on current paper size enum
-                current_size = page_setup.PaperSize
-                if current_size == xlPaperLetter:
-                    available_width = 11.0 if is_landscape else 8.5
-                    selected_name = "Letter (Fallback)"
-                elif current_size == xlPaperA4:
-                    available_width = 11.69 if is_landscape else 8.27
-                    selected_name = "A4 (Fallback)"
-                elif current_size == xlPaperA3:
-                    available_width = 16.54 if is_landscape else 11.69
-                    selected_name = "A3 (Fallback)"
-                else:
-                    available_width = 11.0 if is_landscape else 8.5
-                    selected_name = f"Unknown-{current_size} (Fallback)"
+                logger.warning(f"Could not set any appropriate paper size for width {page_width:.2f}\". Printer may lack support for large sizes.")
+                # We failed to set any size. We are stuck with whatever default is.
+                # Check what we have.
+                try:
+                    current_size = page_setup.PaperSize
+                    # Try to map back to name? 
+                    # Just warn and proceed, or error?
+                    # If we are oversized, we need check threshold against the *attempted* largest?
+                    pass
+                except:
+                    pass
 
-            if selected_name != "Letter":
-                logger.info(f"Using {selected_name} paper for sheet '{sheet.Name}' (Content: {page_width:.1f}\" <= Paper: {available_width:.1f}\")")
+            # 3. Validation and Error (The "Make this file error" requirement)
+            # If still oversized despite using largest paper, OR if we failed to set it and standard one is too small.
             
-            # Check for Microscopic Text
-            if page_width > available_width:
-                shrink_factor = available_width / page_width
-                
-                if shrink_factor < 0.8:
-                    # Determine the theoretical max with 0.8 shrink factor
-                    max_content_width = available_width / 0.8
-                    
-                    # Error condition: text would be too small for OCR
-                    err_msg = (
-                        f"Sheet '{sheet.Name}' is too wide ({page_width:.1f}\") for {selected_name} paper ({available_width:.1f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} < 0.8 = microscopic text. "
-                        f"Max content with 0.8 shrink: {max_content_width:.1f}\". "
-                        f"Arch E max: 55\" (44\" x 0.8 shrink). TIP: Split sheet manually."
-                    )
-                    logger.error(err_msg)
-                    raise ValueError(err_msg)
-                
-                # Otherwise, fit to page (Standard Shrink)
-                page_setup.Zoom = False
-                page_setup.FitToPagesWide = 1
-                self._apply_row_dimensions(sheet, page_setup, excel_settings)
-            else:
-                 # Fits natively
-                 page_setup.Zoom = False
-                 page_setup.FitToPagesWide = 1
-                 self._apply_row_dimensions(sheet, page_setup, excel_settings)
+            # Re-read what we actually have
+            # current_paper_width? Not easily accessible directly without a map.
+            # We assume best effort was made.
             
-            # Set margins (narrow for more content)
-            margin_points = 36  # 0.5 inch
+            if oversized and not paper_set_success:
+                 # Check threshold against the largest size we *tried* to set (Arch E)
+                 limit_to_try = paper_ladder[-1][1]
+                 name_to_try = paper_ladder[-1][2]
+                 
+                 shrink_factor = limit_to_try / page_width
+                 if shrink_factor < 0.8:
+                     err_msg = (
+                        f"Content is too wide ({page_width:.2f}\") for the largest supported paper '{name_to_try}' ({limit_to_try:.2f}\"). "
+                        f"Shrink factor {shrink_factor:.2f} is below 0.8 threshold. Cannot convert safely."
+                     )
+                     logger.error(err_msg)
+                     raise ValueError(err_msg)
+                 else:
+                     logger.warning(f"Content slightly larger than {name_to_try}. Shrinking to fit (Factor: {shrink_factor:.2f})")
+            elif paper_set_success and oversized:
+                 # We successfully set the largest size, but content is still bigger than it
+                 # Check threshold
+                 shrink_factor = limit_width / page_width
+                 if shrink_factor < 0.8:
+                     err_msg = (
+                        f"Content is too wide ({page_width:.2f}\") for selected paper '{selected_name}' ({limit_width:.2f}\"). "
+                        f"Shrink factor {shrink_factor:.2f} is below 0.8 threshold. Cannot convert safely."
+                     )
+                     logger.error(err_msg)
+                     raise ValueError(err_msg)
+
+            # 4. Final Setup
+            page_setup.Zoom = False
+            page_setup.FitToPagesWide = 1
+            self._apply_row_dimensions(sheet, page_setup, excel_settings)
             
-            # Increase Top Margin if metadata header is enabled to avoid overlap
-            top_margin = 72 if excel_settings.metadata_header else 36 # 1.0 inch vs 0.5 inch
-            
+            # Margins
+            margin_points = 36 # 0.5 inch
+            top_margin = 72 if excel_settings.metadata_header else 36
             page_setup.LeftMargin = margin_points
             page_setup.RightMargin = margin_points
             page_setup.TopMargin = top_margin
             page_setup.BottomMargin = margin_points
             
-            logger.debug(f"Applied page setup for sheet '{sheet.Name}'")
-            
         except ValueError:
-            raise  # Re-raise explicit validation errors
+            raise
         except Exception as e:
             logger.warning(f"Could not apply some page setup settings for '{sheet.Name}': {e}")
 

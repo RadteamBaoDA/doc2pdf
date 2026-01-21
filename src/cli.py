@@ -4,6 +4,8 @@ import time
 import shutil
 import threading
 import msvcrt
+import atexit
+from .utils.process_manager import ProcessRegistry
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -119,6 +121,8 @@ def convert(
     
     Supports Word (.doc, .docx), Excel (.xls, .xlsx), and PowerPoint (.ppt, .pptx).
     """
+    # Register cleanup on exit
+    atexit.register(ProcessRegistry.kill_all)
     
     # Configure verbose logging
     current_config = config.copy()
@@ -349,6 +353,7 @@ def convert(
 
     except KeyboardInterrupt:
         logger.warning("Conversion cancelled by user.")
+        ProcessRegistry.kill_all()
         console.print("[bold red]Conversion cancelled by user.[/bold red]")
         sys.exit(130)
             

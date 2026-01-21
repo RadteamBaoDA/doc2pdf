@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from .base import Converter
 from ..config import PDFConversionSettings, LayoutSettings
 from ..utils.logger import logger
+from ..utils.process_manager import ProcessRegistry
 
 # Constants from Word Object Model
 wdExportFormatPDF = 17
@@ -80,12 +81,14 @@ class WordConverter(Converter):
             word = win32com.client.Dispatch("Word.Application")
             word.Visible = False
             word.DisplayAlerts = False
+            ProcessRegistry.register(word)
             yield word
         except Exception as e:
             logger.critical(f"Failed to initialize Microsoft Word: {e}")
             raise
         finally:
             if word:
+                ProcessRegistry.unregister(word)
                 # We generally don't want to kill Word if it was already open effectively, 
                 # but Dispatch logic usually attaches. 
                 # Ideally we check if we created it or not, but strictly quitting is safer for batch processing CLI.

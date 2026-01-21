@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from .base import Converter
 from ..config import PDFConversionSettings, PowerPointSettings
 from ..utils.logger import logger
+from ..utils.process_manager import ProcessRegistry
 
 # Constants from PowerPoint Object Model
 ppFixedFormatTypePDF = 2
@@ -116,12 +117,14 @@ class PowerPointConverter(Converter):
             # Note: PowerPoint doesn't have a Visible property like Word
             # but setting DisplayAlerts to false can help
             ppt.DisplayAlerts = False
+            ProcessRegistry.register(ppt)
             yield ppt
         except Exception as e:
             logger.critical(f"Failed to initialize Microsoft PowerPoint: {e}")
             raise
         finally:
             if ppt:
+                ProcessRegistry.unregister(ppt)
                 ppt.Quit()
 
     def _map_settings(self, settings: PDFConversionSettings, output_path: str) -> dict:

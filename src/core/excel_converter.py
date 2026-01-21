@@ -141,9 +141,10 @@ class ExcelConverter(Converter):
                         # This expands columns to fit text that might otherwise spill over and be cut off
                         self._autofit_columns(sheet, last_col=self._get_true_used_bounds(sheet)[1])
 
-                        # 3. Recalculate Bounds (Shapes + New Column Geometries)
+                        # 3. Recalculate Bounds (Shapes + New Column Geometries) using Geometry
                         # Objects might have shifted, or AutoFit revealed effective width
-                        last_row, last_col = self._get_true_used_bounds(sheet)
+                        content_width, content_height = self._get_content_dimensions_points(sheet)
+                        last_row, last_col = self._get_range_from_dimensions_points(sheet, content_width, content_height)
                         last_col_alpha = self._col_num_to_letter(last_col)
 
                         # Check for Chunking
@@ -181,7 +182,13 @@ class ExcelConverter(Converter):
                                 chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
                                 chunk_settings.row_dimensions = 0 # Force 1 page tall
                                 
-                                self._apply_page_setup(new_sheet, chunk_settings, input_file.name, last_col)
+                                self._apply_page_setup(
+                                    new_sheet, 
+                                    chunk_settings, 
+                                    input_file.name, 
+                                    last_col, 
+                                    content_width_points=content_width
+                                )
 
                                 if on_progress:
                                     on_progress(chunk_weight)
@@ -197,7 +204,13 @@ class ExcelConverter(Converter):
                             if last_row > 0:
                                 sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
                             
-                            self._apply_page_setup(sheet, sheet_excel_settings, input_file.name, last_col)
+                            self._apply_page_setup(
+                                sheet, 
+                                sheet_excel_settings, 
+                                input_file.name, 
+                                last_col, 
+                                content_width_points=content_width
+                            )
                             if sheet_excel_settings.metadata_header:
                                 self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
                             final_sheets_to_process.append(sheet)
@@ -342,7 +355,8 @@ class ExcelConverter(Converter):
     def _calculate_smart_page_size(
         self, 
         sheet, 
-        last_col_index: int
+        last_col_index: int,
+        content_width_points: Optional[float] = None
     ) -> Tuple[float, float]:
         """
         Calculate page width based on actual column widths of used range.
@@ -350,24 +364,28 @@ class ExcelConverter(Converter):
         Args:
             sheet: Excel Worksheet object
             last_col_index: The 1-based index of the last used column (e.g. 5 for Column E)
+            content_width_points: Optional explicit content width in points.
             
         Returns:
             Tuple of (page_width_inches, page_height_inches)
         """
         try:
-            if last_col_index < 1:
+            if last_col_index < 1 and not content_width_points:
                 return self.MIN_PAGE_WIDTH_INCHES, self.DEFAULT_PAGE_HEIGHT_INCHES
                 
-            # Measure width of Range(A:LastCol)
-            # content_width_points = range.Width
-            
-            first_col_char = "A"
-            last_col_char = self._col_num_to_letter(last_col_index)
-            col_range = sheet.Range(f"{first_col_char}1:{last_col_char}1")
-            
-            # .Width corresponds to the width in points of the range
-            content_width_points = col_range.Width
-            content_width_inches = content_width_points / self.POINTS_PER_INCH
+            # Measure width
+            if content_width_points is not None:
+                # Use provided geometry points directly
+                content_width_inches = content_width_points / self.POINTS_PER_INCH
+            else:
+                # Fallback: Measure width of Range(A:LastCol)
+                first_col_char = "A"
+                last_col_char = self._col_num_to_letter(last_col_index)
+                col_range = sheet.Range(f"{first_col_char}1:{last_col_char}1")
+                
+                # .Width corresponds to the width in points of the range
+                content_width_points = col_range.Width
+                content_width_inches = content_width_points / self.POINTS_PER_INCH
             
             # Add a small buffer for margins (0.5 inch total)
             page_width = content_width_inches + 0.5
@@ -391,7 +409,8 @@ class ExcelConverter(Converter):
         sheet, 
         excel_settings: ExcelSettings,
         filename: str,
-        last_col: int
+        last_col: int,
+        content_width_points: Optional[float] = None
     ) -> None:
         """
         Apply page setup settings for OCR-optimized PDF output.
@@ -401,6 +420,7 @@ class ExcelConverter(Converter):
             excel_settings: Excel-specific settings
             filename: Original filename for header
             last_col: Last used column index for width calculation
+            content_width_points: Optional total content width in points
         """
         try:
             page_setup = sheet.PageSetup
@@ -408,7 +428,8 @@ class ExcelConverter(Converter):
             # Calculate smart page size
             page_width, page_height = self._calculate_smart_page_size(
                 sheet, 
-                last_col
+                last_col,
+                content_width_points=content_width_points
             )
             
             # Set orientation
@@ -467,6 +488,7 @@ class ExcelConverter(Converter):
             selected_paper = None
             selected_name = None
             limit_width = 8.5
+            oversized = False  # Initialize to prevent UnboundLocalError
             
             # 1. Find the Smallest Fit and fallback candidates
             candidates = []
@@ -838,3 +860,105 @@ class ExcelConverter(Converter):
                 
         except Exception as e:
             logger.warning(f"Failed to AutoFit columns: {e}")
+
+    def _get_content_dimensions_points(self, sheet) -> Tuple[float, float]:
+        """
+        Calculate total content width and height in points by scanning UsedRange and Shapes.
+        Returns (max_width_points, max_height_points).
+        """
+        max_width = 0.0
+        max_height = 0.0
+        
+        try:
+            # 1. Measure UsedRange (Cells)
+            # UsedRange.Width/Height gives total size of the range
+            # UsedRange.Left/Top gives the offset
+            ur = sheet.UsedRange
+            # Be careful: UsedRange might include empty formatting. 
+            # But for geometry "canvas" size, we typically want to include it if it's "Used".
+            # Or we can stick to cell content.
+            # Using UsedRange is safer for "Paper Size" to avoid cutting borders.
+            max_width = ur.Left + ur.Width
+            max_height = ur.Top + ur.Height
+            
+            # 2. Measure Shapes (Charts, Images)
+            for shape in sheet.Shapes:
+                try:
+                    # Shape.Left/Top/Width/Height are in points
+                    shape_right = shape.Left + shape.Width
+                    shape_bottom = shape.Top + shape.Height
+                    
+                    if shape_right > max_width:
+                        max_width = shape_right
+                    if shape_bottom > max_height:
+                        max_height = shape_bottom
+                        
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            logger.warning(f"Failed to calculate geometry dimensions: {e}")
+            
+        return max_width, max_height
+
+    def _get_range_from_dimensions_points(self, sheet, target_width: float, target_height: float) -> Tuple[int, int]:
+        """
+        Find the Column and Row index that corresponds to the given width/height in points.
+        Returns (last_row_index, last_col_index).
+        """
+        # Start with UsedRange as baseline
+        ur = sheet.UsedRange
+        last_row = ur.Row + ur.Rows.Count - 1
+        last_col = ur.Column + ur.Columns.Count - 1
+        
+        try:
+            # Check Width (Columns)
+            # If target_width is significantly larger than UsedRange, search forward
+            # Tolerance 1.0 point
+            ur_right = ur.Left + ur.Width
+            
+            if target_width > ur_right + 1.0:
+                # Content extends beyond UsedRange
+                # Search forward from last_col
+                current_col_idx = last_col
+                
+                # Safety limit: check 1000 columns max/100 inches? 
+                # Preventing infinite loop
+                max_check = 500 
+                
+                while max_check > 0:
+                    current_col_idx += 1
+                    col_range = sheet.Columns(current_col_idx)
+                    # col.Left is the left edge. We want the column where the content ENDS.
+                    # content ends at target_width. 
+                    # If col.Left > target_width, then the PREVIOUS column contained the end.
+                    if col_range.Left >= target_width:
+                         last_col = current_col_idx - 1
+                         break
+                    max_check -= 1
+                    
+                else: 
+                     # Loop exhausted, just assume we extended effectively
+                     last_col = current_col_idx
+
+            # Check Height (Rows)
+            ur_bottom = ur.Top + ur.Height
+            if target_height > ur_bottom + 1.0:
+                 current_row_idx = last_row
+                 max_check = 5000 # Rows are cheaper/more numerous
+                 
+                 while max_check > 0:
+                     current_row_idx += 1
+                     row_range = sheet.Rows(current_row_idx)
+                     if row_range.Top >= target_height:
+                         last_row = current_row_idx - 1
+                         break
+                     max_check -= 1
+                 else:
+                     last_row = current_row_idx
+                     
+        except Exception as e:
+            logger.warning(f"Failed to map dimensions to range: {e}")
+            
+        return last_row, last_col
+

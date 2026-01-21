@@ -517,7 +517,7 @@ class ExcelConverter(Converter):
                         selected_paper = enum_to_try
                         selected_name = name_to_try
                         limit_width = limit_to_try
-                        logger.info(f"Selected paper size: {selected_name} for width {page_width:.2f}\"")
+                        logger.info(f"Sheet '{sheet.Name}': Selected paper size '{selected_name}' (Limit {limit_width:.2f}\") to fit estimated content width: {page_width:.2f}\"")
                         paper_set_success = True
                         break
                     else:
@@ -552,23 +552,23 @@ class ExcelConverter(Converter):
                  name_to_try = paper_ladder[-1][2]
                  
                  shrink_factor = limit_to_try / page_width
-                 if shrink_factor < 0.8:
+                 if shrink_factor < excel_settings.min_shrink_factor:
                      err_msg = (
-                        f"Content is too wide ({page_width:.2f}\") for the largest supported paper '{name_to_try}' ({limit_to_try:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below 0.8 threshold. Cannot convert safely."
+                        f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for the largest supported paper '{name_to_try}' ({limit_to_try:.2f}\"). "
+                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold. Cannot convert safely."
                      )
                      logger.error(err_msg)
                      raise ValueError(err_msg)
                  else:
-                     logger.warning(f"Content slightly larger than {name_to_try}. Shrinking to fit (Factor: {shrink_factor:.2f})")
+                     logger.warning(f"Sheet '{sheet.Name}': Content slightly larger than {name_to_try}. Shrinking to fit (Factor: {shrink_factor:.2f})")
             elif paper_set_success and oversized:
                  # We successfully set the largest size, but content is still bigger than it
                  # Check threshold
                  shrink_factor = limit_width / page_width
-                 if shrink_factor < 0.8:
+                 if shrink_factor < excel_settings.min_shrink_factor:
                      err_msg = (
-                        f"Content is too wide ({page_width:.2f}\") for selected paper '{selected_name}' ({limit_width:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below 0.8 threshold. Cannot convert safely."
+                        f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for selected paper '{selected_name}' ({limit_width:.2f}\"). "
+                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold. Cannot convert safely."
                      )
                      logger.error(err_msg)
                      raise ValueError(err_msg)

@@ -134,11 +134,18 @@ class ExcelConverter(Converter):
                         
                         logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
                         
-                        # Determine True Bounds (Last Col/Row with actual data)
-                        # This avoids issues where UsedRange is huge due to formatting
+                        # 1. Enforce specific column constraints (Min Width)
+                        self._enforce_min_col_width(sheet, sheet_excel_settings.min_col_width_inches, self._get_true_used_bounds(sheet)[1])
+                        
+                        # 2. AutoFit to ensure text is visible (Estimate Text Size)
+                        # This expands columns to fit text that might otherwise spill over and be cut off
+                        self._autofit_columns(sheet, last_col=self._get_true_used_bounds(sheet)[1])
+
+                        # 3. Recalculate Bounds (Shapes + New Column Geometries)
+                        # Objects might have shifted, or AutoFit revealed effective width
                         last_row, last_col = self._get_true_used_bounds(sheet)
                         last_col_alpha = self._col_num_to_letter(last_col)
-                        
+
                         # Check for Chunking
                         row_lim = sheet_excel_settings.row_dimensions
                         if row_lim and row_lim > 0:
@@ -771,3 +778,63 @@ class ExcelConverter(Converter):
         except Exception as e:
             logger.error(f"Failed to export to PDF: {e}")
             raise
+    def _enforce_min_col_width(self, sheet, min_width_inches: float, last_col: int) -> None:
+        """
+        Ensure all used columns have a minimum width.
+        This prevents columns from being collapsed or too narrow, which can mess up page scaling.
+        """
+        try:
+            if not min_width_inches or min_width_inches <= 0:
+                return
+
+            min_points = min_width_inches * self.POINTS_PER_INCH
+            
+            # Application.InchesToPoints(1) is safer if available, but const 72 is fine.
+            
+            # Iterate columns
+            # Using Range object for columns to check .Width (points)
+            # Efficiently: Check entire range first? No, widths vary.
+            
+            # Optimization: Only check if we suspect issues? 
+            # Or just iterate. processing 50-100 columns is fast.
+            
+            for col_idx in range(1, last_col + 1):
+                col_letter = self._col_num_to_letter(col_idx)
+                col_range = sheet.Range(f"{col_letter}1")
+                
+                current_width_points = col_range.Width
+                if current_width_points < min_points:
+                    # Resize
+                    # ColumnWidth is in characters. Width is in points.
+                    # Ratio: new_char_width = old_char_width * (target_points / old_points)
+                    try:
+                         current_char_width = col_range.ColumnWidth
+                         target_char_width = current_char_width * (min_points / current_width_points) if current_width_points > 0 else 5
+                         col_range.ColumnWidth = target_char_width
+                         logger.debug(f"Resized Col {col_letter} to {target_char_width:.1f} chars ({min_width_inches}\")")
+                    except Exception:
+                        pass
+                        
+        except Exception as e:
+            logger.warning(f"Failed to enforce min column width: {e}")
+
+    def _autofit_columns(self, sheet, last_col: int) -> None:
+        """
+        AutoFit columns to ensure text content is correctly measured.
+        This handles cases where text spills over cell boundaries (which print area calculation misses).
+        """
+        try:
+            # We assume columns 1 to last_col contain data.
+            # Use entire columns for AutoFit to capture headers/data correctly.
+            # Note: This modifies the sheet layout. Since we operate on ReadOnly/Temp session, this is acceptable for output quality.
+            
+            # Using Range(Column A:Column Last)
+            if last_col > 0:
+                first_char = "A"
+                last_char = self._col_num_to_letter(last_col)
+                target_range = sheet.Range(f"{first_char}1:{last_char}1").EntireColumn
+                target_range.AutoFit()
+                logger.debug(f"AutoFitted columns {first_char}:{last_char} to estimate text size.")
+                
+        except Exception as e:
+            logger.warning(f"Failed to AutoFit columns: {e}")

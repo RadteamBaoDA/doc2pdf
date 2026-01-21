@@ -158,7 +158,7 @@ def convert(
     def tui_sink(message):
         record = message.record
         level_name = record['level'].name
-        colors = { "INFO": "green", "WARNING": "yellow", "ERROR": "bold red", "CRITICAL": "bold white on red", "DEBUG": "dim blue" }
+        colors = { "INFO": "green", "WARNING": "yellow", "ERROR": "bold red", "CRITICAL": "bold white on red", "DEBUG": "cyan" }
         color = colors.get(level_name, "white")
         log_msg = f"[{color}]{record['time'].strftime('%H:%M:%S')} | {level_name: <8} | {record['message']}[/{color}]"
         log_buffer.write(log_msg)

@@ -7,15 +7,16 @@ class ProcessRegistry:
     Global registry for tracking active COM process instances (Excel, Word, PowerPoint)
     to ensure they are closed gracefully on application exit or interrupt.
     """
-    _instances: Set[Any] = set()
+    _instances: list[Any] = []
     _lock = threading.Lock()
 
     @classmethod
     def register(cls, instance: Any) -> None:
         """Register a COM instance."""
         with cls._lock:
-            cls._instances.add(instance)
-            logger.debug(f"Registered process instance: {instance}")
+            if instance not in cls._instances:
+                cls._instances.append(instance)
+                logger.debug(f"Registered process instance: {instance}")
 
     @classmethod
     def unregister(cls, instance: Any) -> None:

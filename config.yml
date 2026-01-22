@@ -90,8 +90,7 @@ pdf_settings:
         orientation: "landscape"
         row_dimensions: 10  # null=auto, 0=fit all on one page, N=fixed rows
         metadata_header: true
-        min_col_width_inches: 0.5
-
+        min_shrink_factor: 0.3      # Minimum allowed scaling factor (0.8 = 80%) before erroring out on page size limits
     # Example: Summary sheets fit on one page
     - sheet_name: "*Summary*"
       priority: 50
@@ -104,7 +103,21 @@ pdf_settings:
       priority: 50
       settings:
         excel:
+    # Example: Data sheets with fixed rows per page
+    - sheet_name: "*Data*"
+      priority: 50
+      settings:
+        excel:
           row_dimensions: 10  # 50 rows per page
+
+    # Example: Folder-based override (e.g. "Confidential" folder)
+    - pattern: "*Confidential*"  # Matches file path
+      sheet_name: "*"            # Matches all sheets in those files
+      priority: 100
+      settings:
+        excel:
+          metadata_header: false
+          orientation: "portrait"
 
   # PowerPoint Configuration Rules
   powerpoint:

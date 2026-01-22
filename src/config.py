@@ -62,7 +62,7 @@ class ExcelSettings:
     orientation: str = "landscape"  # portrait, landscape
     row_dimensions: Optional[int] = None  # Rows per page: None=auto, 0=fit all on one page, N=fixed rows
     metadata_header: bool = True  # Print header: sheet name | row range | filename
-    min_col_width_inches: float = 0.5  # Minimum column width for OCR-readable 14pt text
+    min_shrink_factor: float = 0.8  # Minimum allowed scaling factor before error (default 0.8 = 80%)
 
 @dataclass
 class SummaryReportSettings:
@@ -140,7 +140,7 @@ class PDFConversionSettings:
         # Excel settings can be in nested 'excel' key OR at top level
         excel_data = data.get("excel", {})
         # Also check for top-level excel settings (flat structure)
-        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "min_col_width_inches", "sheet_name"]
+        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor"]
         for key in top_level_excel_keys:
             if key in data:
                 # Top-level (flat) settings override nested 'excel' settings
@@ -165,7 +165,7 @@ def load_config(path: Path = CONFIG_FILE) -> Dict[str, Any]:
         return {}
         
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     except Exception as e:
         print(f"Warning: Failed to load configuration from {path}: {e}")
@@ -346,7 +346,7 @@ def get_pdf_settings(input_path: Optional[Path] = None, file_type: FileType = "w
     return PDFConversionSettings.from_dict(final_settings_dict)
 
 
-def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConversionSettings] = None) -> PDFConversionSettings:
+def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConversionSettings] = None, input_path: Optional[Path] = None) -> PDFConversionSettings:
     """
     Get Excel PDF settings by applying sheet_name-based Pattern-Priority rules.
     
@@ -360,6 +360,7 @@ def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConvers
     Args:
         sheet_name: The Excel sheet name to check against rule patterns.
         base_settings: Optional base settings to merge into.
+        input_path: Optional file path to check against rule patterns.
     
     Returns:
         PDFConversionSettings with merged sheet-specific settings.
@@ -371,14 +372,35 @@ def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConvers
     if not isinstance(rules, list):
         return base_settings or PDFConversionSettings()
 
-    # Filter matching rules by sheet_name pattern
+    # Filter matching rules
     matching_rules = []
+    
+    # Determine path string for matching
+    path_str = input_path.as_posix() if input_path else ""
+
     for rule in rules:
-        pattern = rule.get("sheet_name", rule.get("pattern", "*"))
-        priority = rule.get("priority", 0)
+        # Check Sheet Name Pattern
+        # Default to "*" (match all sheets) if missing, but usually Excel rules are sheet-based
+        sheet_pattern = rule.get("sheet_name", "*") # Backward compat or default
         
-        # Use fnmatch for glob-style pattern matching
-        if fnmatch.fnmatch(sheet_name, pattern):
+        # Check File Path Pattern (New)
+        # Default to "*" (match all files) if missing
+        file_pattern = rule.get("pattern", "*")
+        
+        # 1. Check Sheet Name Match
+        sheet_match = fnmatch.fnmatch(sheet_name, sheet_pattern)
+        
+        # 2. Check File Path Match
+        file_match = True
+        if input_path:
+             if file_pattern != "*":
+                file_match = input_path.match(file_pattern)
+        else:
+             # If no input path provided, only match if pattern is universal
+             if file_pattern != "*":
+                 file_match = False
+
+        if sheet_match and file_match:
             matching_rules.append(rule)
     
     # Sort by priority ascending (higher priority overrides)
@@ -412,7 +434,7 @@ def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConvers
                 "orientation": base_settings.excel.orientation,
                 "row_dimensions": base_settings.excel.row_dimensions,
                 "metadata_header": base_settings.excel.metadata_header,
-                "min_col_width_inches": base_settings.excel.min_col_width_inches,
+                "min_shrink_factor": base_settings.excel.min_shrink_factor,
             }
     else:
         final_settings_dict = {}

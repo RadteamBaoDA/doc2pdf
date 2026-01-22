@@ -13,6 +13,10 @@ def setup_logger(config: Optional[dict] = None) -> Optional[int]:
     # Remove default handler
     logger.remove()
     
+    # Improve visibility for DEBUG on black backgrounds (default blue is too dark)
+    logger.level("DEBUG", color="<cyan>")
+
+    
     if config is None:
         # Fallback default
         logger.add(sys.stderr, level="INFO")

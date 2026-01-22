@@ -134,15 +134,8 @@ class ExcelConverter(Converter):
                         
                         logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
                         
-                        # 1. Enforce specific column constraints (Min Width)
-                        self._enforce_min_col_width(sheet, sheet_excel_settings.min_col_width_inches, self._get_true_used_bounds(sheet)[1])
-                        
-                        # 2. AutoFit to ensure text is visible (Estimate Text Size)
-                        # This expands columns to fit text that might otherwise spill over and be cut off
-                        self._autofit_columns(sheet, last_col=self._get_true_used_bounds(sheet)[1])
-
-                        # 3. Recalculate Bounds (Shapes + New Column Geometries) using Geometry
-                        # Objects might have shifted, or AutoFit revealed effective width
+                        # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
+                        # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
                         content_width, content_height = self._get_content_dimensions_points(sheet)
                         last_row, last_col = self._get_range_from_dimensions_points(sheet, content_width, content_height)
                         last_col_alpha = self._col_num_to_letter(last_col)
@@ -489,6 +482,7 @@ class ExcelConverter(Converter):
             selected_name = None
             limit_width = 8.5
             oversized = False  # Initialize to prevent UnboundLocalError
+            paper_set_success = False  # Initialize to prevent UnboundLocalError
             
             # 1. Find the Smallest Fit and fallback candidates
             candidates = []
@@ -528,16 +522,23 @@ class ExcelConverter(Converter):
             
             if not paper_set_success:
                 logger.warning(f"Could not set any appropriate paper size for width {page_width:.2f}\". Printer may lack support for large sizes.")
-                # We failed to set any size. We are stuck with whatever default is.
-                # Check what we have.
-                try:
-                    current_size = page_setup.PaperSize
-                    # Try to map back to name? 
-                    # Just warn and proceed, or error?
-                    # If we are oversized, we need check threshold against the *attempted* largest?
-                    pass
-                except:
-                    pass
+                # Fallback: Try all paper sizes from largest to smallest to find the biggest the printer supports
+                fallback_sizes = list(reversed(paper_ladder))  # Try from largest to smallest
+                for (fb_enum, fb_width, fb_name) in fallback_sizes:
+                    try:
+                        page_setup.PaperSize = fb_enum
+                        if page_setup.PaperSize == fb_enum:
+                            selected_paper = fb_enum
+                            selected_name = fb_name
+                            limit_width = fb_width
+                            paper_set_success = True
+                            logger.info(f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - largest size supported by printer. Content will be scaled to fit.")
+                            break
+                    except Exception:
+                        continue
+                
+                if not paper_set_success:
+                    logger.warning("Could not set any paper size. Using printer default.")
 
             # 3. Validation and Error (The "Make this file error" requirement)
             # If still oversized despite using largest paper, OR if we failed to set it and standard one is too small.
@@ -635,9 +636,6 @@ class ExcelConverter(Converter):
             page_setup.LeftFooter = ""
             
             logger.debug(f"Applied metadata header for sheet '{sheet.Name}' (Center: '{center_text}')")
-            
-        except Exception as e:
-            logger.warning(f"Could not apply metadata header for '{sheet.Name}': {e}")
             
         except Exception as e:
             logger.warning(f"Could not apply metadata header for '{sheet.Name}': {e}")
@@ -863,38 +861,110 @@ class ExcelConverter(Converter):
 
     def _get_content_dimensions_points(self, sheet) -> Tuple[float, float]:
         """
-        Calculate total content width and height in points by scanning UsedRange and Shapes.
+        Calculate total content width and height in points by summing column widths.
+        
+        Flow:
+        1. Get current cols in sheet (find last column with data)
+        2. Get size of each column in points (Excel uses points internally)
+        3. Calculate total points
+        4. Convert to inches for page sizing
+        5. Return as max_width
+        
         Returns (max_width_points, max_height_points).
         """
         max_width = 0.0
         max_height = 0.0
         
+        # Screen DPI assumption for pixel conversion (standard 96 DPI)
+        PIXELS_PER_INCH = 96.0
+        POINTS_PER_INCH = 72.0
+        
         try:
-            # 1. Measure UsedRange (Cells)
-            # UsedRange.Width/Height gives total size of the range
-            # UsedRange.Left/Top gives the offset
-            ur = sheet.UsedRange
-            # Be careful: UsedRange might include empty formatting. 
-            # But for geometry "canvas" size, we typically want to include it if it's "Used".
-            # Or we can stick to cell content.
-            # Using UsedRange is safer for "Paper Size" to avoid cutting borders.
-            max_width = ur.Left + ur.Width
-            max_height = ur.Top + ur.Height
+            # 1. Find TRUE Last Row and Column (using Cells.Find)
+            last_row = 1
+            last_col = 1
             
-            # 2. Measure Shapes (Charts, Images)
+            try:
+                last_row_cell = sheet.Cells.Find(
+                    What="*",
+                    After=sheet.Range("A1"),
+                    LookIn=-4163,  # xlValues
+                    LookAt=2,      # xlPart
+                    SearchOrder=self.xlByRows,
+                    SearchDirection=self.xlPrevious
+                )
+                if last_row_cell:
+                    last_row = last_row_cell.Row
+            except Exception:
+                last_row = sheet.UsedRange.Rows.Count
+            
+            try:
+                last_col_cell = sheet.Cells.Find(
+                    What="*",
+                    After=sheet.Range("A1"),
+                    LookIn=-4163,  # xlValues
+                    LookAt=2,      # xlPart
+                    SearchOrder=self.xlByColumns,
+                    SearchDirection=self.xlPrevious
+                )
+                if last_col_cell:
+                    last_col = last_col_cell.Column
+            except Exception:
+                last_col = sheet.UsedRange.Columns.Count
+            
+            # 2. Sum width of each column (in points)
+            # Excel's Column.Width property returns width in points
+            total_width_points = 0.0
+            
+            for col_idx in range(1, last_col + 1):
+                try:
+                    # sheet.Columns(col_idx).Width returns width in points
+                    col_width = sheet.Columns(col_idx).Width
+                    total_width_points += col_width
+                except Exception:
+                    # Fallback: assume default column width (~64 points = 8.43 characters at 7.5pt/char)
+                    total_width_points += 64.0
+            
+            # 3. Sum height of each row (in points)
+            total_height_points = 0.0
+            
+            for row_idx in range(1, last_row + 1):
+                try:
+                    # sheet.Rows(row_idx).Height returns height in points
+                    row_height = sheet.Rows(row_idx).Height
+                    total_height_points += row_height
+                except Exception:
+                    # Fallback: assume default row height (~15 points)
+                    total_height_points += 15.0
+            
+            max_width = total_width_points
+            max_height = total_height_points
+            
+            logger.debug(
+                f"Sheet '{sheet.Name}' Column Sum: "
+                f"Cols=1-{last_col}, Total Width={total_width_points:.1f}pt ({total_width_points/POINTS_PER_INCH:.2f}in) | "
+                f"Rows=1-{last_row}, Total Height={total_height_points:.1f}pt ({total_height_points/POINTS_PER_INCH:.2f}in)"
+            )
+            
+            # 4. Expand for Shapes (Charts, Images) - they might extend beyond cell content
             for shape in sheet.Shapes:
                 try:
-                    # Shape.Left/Top/Width/Height are in points
                     shape_right = shape.Left + shape.Width
                     shape_bottom = shape.Top + shape.Height
                     
                     if shape_right > max_width:
+                        logger.debug(f"Shape '{shape.Name}' extends width to {shape_right:.1f}pt ({shape_right/POINTS_PER_INCH:.2f}in)")
                         max_width = shape_right
                     if shape_bottom > max_height:
                         max_height = shape_bottom
                         
                 except Exception:
                     continue
+            
+            logger.info(
+                f"Sheet '{sheet.Name}' Final Content Dimensions: "
+                f"{max_width:.1f}pt ({max_width/POINTS_PER_INCH:.2f}in) x {max_height:.1f}pt ({max_height/POINTS_PER_INCH:.2f}in)"
+            )
                     
         except Exception as e:
             logger.warning(f"Failed to calculate geometry dimensions: {e}")

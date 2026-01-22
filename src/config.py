@@ -62,7 +62,6 @@ class ExcelSettings:
     orientation: str = "landscape"  # portrait, landscape
     row_dimensions: Optional[int] = None  # Rows per page: None=auto, 0=fit all on one page, N=fixed rows
     metadata_header: bool = True  # Print header: sheet name | row range | filename
-    min_col_width_inches: float = 0.5  # Minimum column width for OCR-readable 14pt text
     min_shrink_factor: float = 0.8  # Minimum allowed scaling factor before error (default 0.8 = 80%)
 
 @dataclass
@@ -141,7 +140,7 @@ class PDFConversionSettings:
         # Excel settings can be in nested 'excel' key OR at top level
         excel_data = data.get("excel", {})
         # Also check for top-level excel settings (flat structure)
-        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "min_col_width_inches", "sheet_name", "min_shrink_factor"]
+        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor"]
         for key in top_level_excel_keys:
             if key in data:
                 # Top-level (flat) settings override nested 'excel' settings
@@ -435,7 +434,6 @@ def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConvers
                 "orientation": base_settings.excel.orientation,
                 "row_dimensions": base_settings.excel.row_dimensions,
                 "metadata_header": base_settings.excel.metadata_header,
-                "min_col_width_inches": base_settings.excel.min_col_width_inches,
                 "min_shrink_factor": base_settings.excel.min_shrink_factor,
             }
     else:

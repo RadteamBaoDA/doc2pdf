@@ -237,7 +237,7 @@ def test_smart_page_size_calculation(converter, mock_excel_app, tmp_path):
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
     settings = PDFConversionSettings(
-        excel=ExcelSettings(min_col_width_inches=0.5)
+        excel=ExcelSettings()
     )
     
     # Calculate expected page width: 50 * 0.5 = 25 inches

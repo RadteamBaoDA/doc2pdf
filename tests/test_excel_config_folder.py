@@ -38,7 +38,7 @@ MOCK_EXCEL_CONFIG = {
                 "sheet_name": "*Summary*",
                 "priority": 150,
                 "settings": {
-                    "excel": {"row_dimensions": 10, "min_col_width_inches": 1.0}
+                    "excel": {"row_dimensions": 10}
                 }
             }
         ]
@@ -113,7 +113,6 @@ def test_excel_settings_folder_and_sheet_match(mock_load_config):
     assert settings.excel.orientation == "portrait"
     assert settings.excel.metadata_header is False
     assert settings.excel.row_dimensions == 10
-    assert settings.excel.min_col_width_inches == 1.0
 
 def test_no_input_path(mock_load_config):
     """Test behavior when input_path is missing (Legacy call)."""

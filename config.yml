@@ -90,8 +90,7 @@ pdf_settings:
         orientation: "landscape"
         row_dimensions: 10  # null=auto, 0=fit all on one page, N=fixed rows
         metadata_header: true
-        min_col_width_inches: 0.5   # Minimum width (inches) for columns to ensure content isn't hidden
-        min_shrink_factor: 0.5      # Minimum allowed scaling factor (0.8 = 80%) before erroring out on page size limits one page
+        min_shrink_factor: 0.3      # Minimum allowed scaling factor (0.8 = 80%) before erroring out on page size limits
     # Example: Summary sheets fit on one page
     - sheet_name: "*Summary*"
       priority: 50

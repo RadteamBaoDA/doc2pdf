@@ -136,8 +136,8 @@ class ExcelConverter(Converter):
                         
                         # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
                         # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
-                        content_width, content_height = self._get_content_dimensions_points(sheet)
-                        last_row, last_col = self._get_range_from_dimensions_points(sheet, content_width, content_height)
+                        # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
+                        content_width, content_height, last_row, last_col = self._get_content_dimensions_points(sheet)
                         last_col_alpha = self._col_num_to_letter(last_col)
 
                         # Check for Chunking
@@ -731,7 +731,7 @@ class ExcelConverter(Converter):
             logger.error(f"Failed to export to PDF: {e}")
             raise
 
-    def _get_content_dimensions_points(self, sheet) -> Tuple[float, float]:
+    def _get_content_dimensions_points(self, sheet) -> Tuple[float, float, int, int]:
         """
         Calculate total content width and height in points by summing column widths.
         
@@ -742,7 +742,7 @@ class ExcelConverter(Converter):
         4. Convert to inches for page sizing
         5. Return as max_width
         
-        Returns (max_width_points, max_height_points).
+        Returns (max_width_points, max_height_points, last_row, last_col).
         """
         max_width = 0.0
         max_height = 0.0
@@ -829,6 +829,17 @@ class ExcelConverter(Converter):
                         max_width = shape_right
                     if shape_bottom > max_height:
                         max_height = shape_bottom
+                    
+                    # Also update row/col indices if shape extends beyond
+                    try:
+                        br_cell = shape.BottomRightCell
+                        if br_cell:
+                            if br_cell.Row > last_row:
+                                last_row = br_cell.Row
+                            if br_cell.Column > last_col:
+                                last_col = br_cell.Column
+                    except Exception:
+                        pass
                         
                 except Exception:
                     continue
@@ -841,66 +852,6 @@ class ExcelConverter(Converter):
         except Exception as e:
             logger.warning(f"Failed to calculate geometry dimensions: {e}")
             
-        return max_width, max_height
+        return max_width, max_height, last_row, last_col
 
-    def _get_range_from_dimensions_points(self, sheet, target_width: float, target_height: float) -> Tuple[int, int]:
-        """
-        Find the Column and Row index that corresponds to the given width/height in points.
-        Returns (last_row_index, last_col_index).
-        """
-        # Start with UsedRange as baseline
-        ur = sheet.UsedRange
-        last_row = ur.Row + ur.Rows.Count - 1
-        last_col = ur.Column + ur.Columns.Count - 1
-        
-        try:
-            # Check Width (Columns)
-            # If target_width is significantly larger than UsedRange, search forward
-            # Tolerance 1.0 point
-            ur_right = ur.Left + ur.Width
-            
-            if target_width > ur_right + 1.0:
-                # Content extends beyond UsedRange
-                # Search forward from last_col
-                current_col_idx = last_col
-                
-                # Safety limit: check 1000 columns max/100 inches? 
-                # Preventing infinite loop
-                max_check = 500 
-                
-                while max_check > 0:
-                    current_col_idx += 1
-                    col_range = sheet.Columns(current_col_idx)
-                    # col.Left is the left edge. We want the column where the content ENDS.
-                    # content ends at target_width. 
-                    # If col.Left > target_width, then the PREVIOUS column contained the end.
-                    if col_range.Left >= target_width:
-                         last_col = current_col_idx - 1
-                         break
-                    max_check -= 1
-                    
-                else: 
-                     # Loop exhausted, just assume we extended effectively
-                     last_col = current_col_idx
-
-            # Check Height (Rows)
-            ur_bottom = ur.Top + ur.Height
-            if target_height > ur_bottom + 1.0:
-                 current_row_idx = last_row
-                 max_check = 5000 # Rows are cheaper/more numerous
-                 
-                 while max_check > 0:
-                     current_row_idx += 1
-                     row_range = sheet.Rows(current_row_idx)
-                     if row_range.Top >= target_height:
-                         last_row = current_row_idx - 1
-                         break
-                     max_check -= 1
-                 else:
-                     last_row = current_row_idx
-                     
-        except Exception as e:
-            logger.warning(f"Failed to map dimensions to range: {e}")
-            
-        return last_row, last_col
 

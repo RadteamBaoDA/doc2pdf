@@ -134,6 +134,10 @@ class ExcelConverter(Converter):
                         
                         logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
                         
+                        # Insert OCR sheet name label if enabled
+                        if sheet_excel_settings.ocr_sheet_name_label:
+                            self._insert_sheet_name_label(sheet, sheet.Name)
+                        
                         # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
                         # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
                         # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
@@ -639,6 +643,33 @@ class ExcelConverter(Converter):
             
         except Exception as e:
             logger.warning(f"Could not apply metadata header for '{sheet.Name}': {e}")
+
+    def _insert_sheet_name_label(self, sheet, sheet_name: str) -> None:
+        """
+        Insert a new row at the beginning and add sheet name with font size 23.
+        
+        This feature adds the sheet name as a large, bold label in the first row
+        to improve OCR recognition of the sheet name.
+        
+        Args:
+            sheet: Excel Worksheet object
+            sheet_name: Name of the sheet to insert as label
+        """
+        try:
+            # Insert new row at position 1
+            sheet.Rows(1).Insert()
+            
+            # Set sheet name in cell A1
+            cell = sheet.Cells(1, 1)
+            cell.Value = sheet_name
+            
+            # Set font size to 23 for OCR readability
+            cell.Font.Size = 23
+            cell.Font.Bold = True
+            
+            logger.debug(f"Inserted OCR sheet name label for '{sheet_name}'")
+        except Exception as e:
+            logger.warning(f"Could not insert OCR sheet name label for '{sheet_name}': {e}")
 
 
     def _col_num_to_letter(self, n: int) -> str:

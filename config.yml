@@ -91,6 +91,7 @@ pdf_settings:
         row_dimensions: 10  # null=auto, 0=fit all on one page, N=fixed rows
         metadata_header: true
         min_shrink_factor: 0.3      # Minimum allowed scaling factor (0.8 = 80%) before erroring out on page size limits
+        ocr_sheet_name_label: true  # Insert sheet name as large text (size 23) in row 1 for OCR
     # Example: Summary sheets fit on one page
     - sheet_name: "*Summary*"
       priority: 50

@@ -4,9 +4,19 @@ from typing import Any, Dict, Optional, List, Literal
 from dataclasses import dataclass, field, asdict
 import fnmatch
 
-CONFIG_FILE = Path("config.yml")
+_CONFIG_PATH: Path = Path("config.yml")
 
-# Supported file types
+def set_config_path(path: Path) -> None:
+    """Set the global configuration file path."""
+    global _CONFIG_PATH
+    _CONFIG_PATH = path
+
+def get_config_path() -> Path:
+    """Get the current configuration file path."""
+    return _CONFIG_PATH
+
+
+
 FileType = Literal["word", "excel", "powerpoint"]
 
 
@@ -158,10 +168,13 @@ class PDFConversionSettings:
             excel=ExcelSettings(**excel_data) if excel_data else None,
         )
 
-def load_config(path: Path = CONFIG_FILE) -> Dict[str, Any]:
+def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     """
     Load configuration from a YAML file.
     """
+    if path is None:
+        path = _CONFIG_PATH
+
     if not path.exists():
         return {}
         

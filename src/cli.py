@@ -30,7 +30,11 @@ from .core.powerpoint_converter import PowerPointConverter
 from .core.excel_converter import ExcelConverter
 from .core.pdf_processor import PDFProcessor
 from .utils.logger import setup_logger, logger
-from .config import get_logging_config, get_pdf_settings, get_suffix_config, get_reporting_config, get_post_processing_config, get_pdf_handling_config, FileType
+from .config import (
+    get_logging_config, get_pdf_settings, get_suffix_config, 
+    get_reporting_config, get_post_processing_config, get_pdf_handling_config, FileType,
+    set_config_path, get_config_path
+)
 
 app = typer.Typer(
     name="doc2pdf",
@@ -51,7 +55,7 @@ app = typer.Typer(
 )
 console = Console()
 
-config = get_logging_config()
+
 
 def version_callback(value: bool):
     if value:
@@ -108,6 +112,7 @@ def get_file_type(path: Path) -> FileType:
 def convert(
     input_path: Path = typer.Argument(Path("input"), help="Path to the input file or directory", exists=True),
     output_path: Optional[Path] = typer.Option(Path("output"), "--output", "-o", help="Path to the output PDF or Directory"),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to configuration file", exists=True, dir_okay=False),
     verbose: bool = typer.Option(False, "--verbose", help="Enable verbose logging"),
     trim: Optional[bool] = typer.Option(None, "--trim/--no-trim", help="Trim whitespace from output PDF (overrides config.yml)"),
     trim_margin: Optional[float] = typer.Option(None, "--trim-margin", help="Margin in points when trimming (default: 10)"),
@@ -124,6 +129,14 @@ def convert(
     # Register cleanup on exit
     atexit.register(ProcessRegistry.kill_all)
     
+    # Configure config path if provided
+    if config_path:
+        set_config_path(config_path)
+
+    # Load config (refresh in case path changed)
+    config = get_logging_config()
+
+
     # Configure verbose logging
     current_config = config.copy()
     if verbose:
@@ -131,6 +144,9 @@ def convert(
     
     # Capture console handler ID to remove it later during TUI to prevent flashing
     console_handler_id = setup_logger(current_config)
+
+    # Log config path
+    logger.info(f"Using configuration file: {get_config_path().resolve()}")
 
     files = get_files(input_path)
     

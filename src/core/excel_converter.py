@@ -581,6 +581,7 @@ class ExcelConverter(Converter):
             # 4. Final Setup
             page_setup.Zoom = False
             page_setup.FitToPagesWide = 1
+            page_setup.BlackAndWhite = False  # Ensure color rendering for charts/text labels
             self._apply_row_dimensions(sheet, page_setup, excel_settings)
             
             # Margins

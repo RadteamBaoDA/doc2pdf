@@ -42,7 +42,8 @@ class PowerPointConverter(Converter):
         self, 
         input_path: Path, 
         output_path: Optional[Path] = None, 
-        settings: Optional[PDFConversionSettings] = None
+        settings: Optional[PDFConversionSettings] = None,
+        base_path: Optional[Path] = None
     ) -> Path:
         """
         Convert a PowerPoint document to PDF.

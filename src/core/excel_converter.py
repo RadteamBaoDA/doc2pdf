@@ -50,6 +50,11 @@ xlPrintNoComments = -4142
 xlSheetVisible = -1
 
 
+class OversizedSheetError(Exception):
+    """Raised when a sheet is too large to print at acceptable quality."""
+    pass
+
+
 class ExcelConverter(Converter):
     """
     Converter for Excel documents (.xlsx, .xls, .xlsm, .xlsb) to PDF.
@@ -69,22 +74,30 @@ class ExcelConverter(Converter):
     xlByColumns = 2
     xlPrevious = 2
     
-    def convert(self, input_file: Path, output_file: Path, settings: PDFConversionSettings, on_progress: Optional[Callable[[float], None]] = None) -> None:
+    def convert(
+        self, 
+        input_path: Path, 
+        output_path: Optional[Path] = None, 
+        settings: Optional[PDFConversionSettings] = None,
+        on_progress: Optional[Callable[[float], None]] = None,
+        base_path: Optional[Path] = None
+    ) -> Path:
         """
         Convert Excel file to PDF using COM automation.
         
         Args:
-            input_file: Path to source Excel file
-            output_file: Path to destination PDF file
+            input_path: Path to source Excel file
+            output_path: Path to destination PDF file
             settings: PDFConversionSettings object containing conversion configuration
             on_progress: Optional callback for partial progress (0.0 to 1.0)
+            base_path: Optional root directory for relative path matching
         """    
-        input_file = input_file.resolve()
+        input_file = input_path.resolve()
         if not input_file.exists():
             raise FileNotFoundError(f"Input file not found: {input_file}")
             
-        if output_file:
-            out_file = output_file.resolve()
+        if output_path:
+            out_file = output_path.resolve()
         else:
             out_file = input_file.with_suffix(".pdf")
             
@@ -129,99 +142,112 @@ class ExcelConverter(Converter):
                     sheet_weight = 1.0 / total_sheets if total_sheets > 0 else 0
                     
                     # Apply page setup and process chunks
+                    skipped_sheets = []  # Track skipped oversized sheets
                     for sheet in sheets_to_export:
-                        # Get sheet-specific settings
-                        # Note: Arguments are (sheet_name, base_settings, input_path)
-                        sheet_settings = get_excel_sheet_settings(sheet.Name, settings, input_file)
-                        sheet_excel_settings = sheet_settings.excel or excel_settings
-                        
-                        logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
-                        
-                        # Insert OCR sheet name label if enabled
-                        if sheet_excel_settings.ocr_sheet_name_label:
-                            self._insert_sheet_name_label(sheet, sheet.Name)
-                        
-                        # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
-                        # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
-                        # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
-                        content_width, content_height, last_row, last_col = self._get_content_dimensions_points(sheet)
-                        
-                        # Insert file path row if enabled (before last row)
-                        if sheet_excel_settings.is_write_file_path:
-                            last_row = self._insert_file_path_row(sheet, input_file, last_row, last_col)
-                        
-                        last_col_alpha = self._col_num_to_letter(last_col)
+                        try:
+                            # Get sheet-specific settings
+                            # Note: Arguments are (sheet_name, base_settings, input_path, base_path)
+                            sheet_settings = get_excel_sheet_settings(sheet.Name, settings, input_file, base_path)
+                            sheet_excel_settings = sheet_settings.excel or excel_settings
+                            
+                            logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
+                            
+                            # Insert OCR sheet name label if enabled
+                            if sheet_excel_settings.ocr_sheet_name_label:
+                                self._insert_sheet_name_label(sheet, sheet.Name)
+                            
+                            # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
+                            # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
+                            # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
+                            content_width, content_height, last_row, last_col = self._get_content_dimensions_points(sheet)
+                            
+                            # Insert file path row if enabled (before last row)
+                            if sheet_excel_settings.is_write_file_path:
+                                last_row = self._insert_file_path_row(sheet, input_file, last_row, last_col)
+                            
+                            last_col_alpha = self._col_num_to_letter(last_col)
 
-                        # Check for Chunking
-                        row_lim = sheet_excel_settings.row_dimensions
-                        if row_lim and row_lim > 0:
-                            # Chunking Mode
-                            # Use true last_row instead of UsedRange
-                            if last_row == 0:
-                                # Empty sheet
-                                if on_progress: on_progress(sheet_weight)
-                                continue
+                            # Check for Chunking
+                            row_lim = sheet_excel_settings.row_dimensions
+                            if row_lim and row_lim > 0:
+                                # Chunking Mode
+                                # Use true last_row instead of UsedRange
+                                if last_row == 0:
+                                    # Empty sheet
+                                    if on_progress: on_progress(sheet_weight)
+                                    continue
+                                    
+                                chunks = (last_row + row_lim - 1) // row_lim
+                                logger.info(f"Splitting sheet '{sheet.Name}' into {chunks} chunks (Rows: {row_lim})")
                                 
-                            chunks = (last_row + row_lim - 1) // row_lim
-                            logger.info(f"Splitting sheet '{sheet.Name}' into {chunks} chunks (Rows: {row_lim})")
-                            
-                            # Weight for each chunk
-                            chunk_weight = sheet_weight / chunks
-                            
-                            for i in range(chunks):
-                                start_row = i * row_lim + 1
-                                end_row = min((i + 1) * row_lim, last_row)
+                                # Weight for each chunk
+                                chunk_weight = sheet_weight / chunks
                                 
-                                # Copy sheet to end
-                                last_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                sheet.Copy(None, last_sheet)
-                                new_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                
-                                temp_sheets_to_delete.append(new_sheet)
-                                
-                                # Set Print Area explicitly to True content columns
-                                # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
-                                new_sheet.PageSetup.PrintArea = f"$A${start_row}:${last_col_alpha}${end_row}"
-                                
-                                # Create chunk settings
-                                chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
-                                chunk_settings.row_dimensions = 0 # Force 1 page tall
+                                for i in range(chunks):
+                                    start_row = i * row_lim + 1
+                                    end_row = min((i + 1) * row_lim, last_row)
+                                    
+                                    # Copy sheet to end
+                                    last_sheet = workbook.Sheets(workbook.Sheets.Count)
+                                    sheet.Copy(None, last_sheet)
+                                    new_sheet = workbook.Sheets(workbook.Sheets.Count)
+                                    
+                                    temp_sheets_to_delete.append(new_sheet)
+                                    
+                                    # Set Print Area explicitly to True content columns
+                                    # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
+                                    new_sheet.PageSetup.PrintArea = f"$A${start_row}:${last_col_alpha}${end_row}"
+                                    
+                                    # Create chunk settings
+                                    chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
+                                    chunk_settings.row_dimensions = 0 # Force 1 page tall
+                                    
+                                    self._apply_page_setup(
+                                        new_sheet, 
+                                        chunk_settings, 
+                                        input_file.name, 
+                                        last_col, 
+                                        content_width_points=content_width
+                                    )
+
+                                    if on_progress:
+                                        on_progress(chunk_weight)
+                                    
+                                    if sheet_excel_settings.metadata_header:
+                                        center_text = f"{start_row}-{end_row}"
+                                        self._apply_metadata_header(new_sheet, sheet_excel_settings, input_file.name, center_text, left_text=sheet.Name)
+                                        
+                                    final_sheets_to_process.append(new_sheet)
+                            else:
+                                # Standard Mode
+                                # Set print area to avoid printing 1000 blank pages of formatting
+                                if last_row > 0:
+                                    sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
                                 
                                 self._apply_page_setup(
-                                    new_sheet, 
-                                    chunk_settings, 
+                                    sheet, 
+                                    sheet_excel_settings, 
                                     input_file.name, 
                                     last_col, 
                                     content_width_points=content_width
                                 )
-
-                                if on_progress:
-                                    on_progress(chunk_weight)
-                                
                                 if sheet_excel_settings.metadata_header:
-                                    center_text = f"{start_row}-{end_row}"
-                                    self._apply_metadata_header(new_sheet, sheet_excel_settings, input_file.name, center_text, left_text=sheet.Name)
-                                    
-                                final_sheets_to_process.append(new_sheet)
-                        else:
-                            # Standard Mode
-                            # Set print area to avoid printing 1000 blank pages of formatting
-                            if last_row > 0:
-                                sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
-                            
-                            self._apply_page_setup(
-                                sheet, 
-                                sheet_excel_settings, 
-                                input_file.name, 
-                                last_col, 
-                                content_width_points=content_width
-                            )
-                            if sheet_excel_settings.metadata_header:
-                                self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
-                            final_sheets_to_process.append(sheet)
-                            
+                                    self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
+                                final_sheets_to_process.append(sheet)
+                                
+                                if on_progress:
+                                    on_progress(sheet_weight)
+                        
+                        except OversizedSheetError:
+                            # Sheet is too large and configured to skip
+                            skipped_sheets.append(sheet.Name)
                             if on_progress:
                                 on_progress(sheet_weight)
+                            continue
+                    
+                    # Log skipped sheets summary
+                    if skipped_sheets:
+                        logger.warning(f"Skipped {len(skipped_sheets)} oversized sheet(s): {', '.join(skipped_sheets)}")
                     
                     # Export to PDF
                     if final_sheets_to_process:
@@ -570,10 +596,17 @@ class ExcelConverter(Converter):
                  if shrink_factor < excel_settings.min_shrink_factor:
                      err_msg = (
                         f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for the largest supported paper '{name_to_try}' ({limit_to_try:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold. Cannot convert safely."
+                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold."
                      )
-                     logger.error(err_msg)
-                     raise ValueError(err_msg)
+                     # Check oversized_action config
+                     if excel_settings.oversized_action == "skip":
+                         logger.warning(f"{err_msg} Skipping sheet.")
+                         raise OversizedSheetError(err_msg)
+                     elif excel_settings.oversized_action == "warn":
+                         logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
+                     else:  # "error" (default)
+                         logger.error(err_msg)
+                         raise ValueError(err_msg)
                  else:
                      logger.warning(f"Sheet '{sheet.Name}': Content slightly larger than {name_to_try}. Shrinking to fit (Factor: {shrink_factor:.2f})")
             elif paper_set_success and oversized:
@@ -583,10 +616,17 @@ class ExcelConverter(Converter):
                  if shrink_factor < excel_settings.min_shrink_factor:
                      err_msg = (
                         f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for selected paper '{selected_name}' ({limit_width:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold. Cannot convert safely."
+                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold."
                      )
-                     logger.error(err_msg)
-                     raise ValueError(err_msg)
+                     # Check oversized_action config
+                     if excel_settings.oversized_action == "skip":
+                         logger.warning(f"{err_msg} Skipping sheet.")
+                         raise OversizedSheetError(err_msg)
+                     elif excel_settings.oversized_action == "warn":
+                         logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
+                     else:  # "error" (default)
+                         logger.error(err_msg)
+                         raise ValueError(err_msg)
 
             # 4. Final Setup
             page_setup.Zoom = False

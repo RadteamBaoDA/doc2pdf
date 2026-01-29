@@ -226,7 +226,9 @@ def convert(
                 tui_ctx.update_progress(progress)
                 
                 # Get settings
-                settings = get_pdf_settings(input_path=file_path, file_type=file_type)
+                # base_path is the root input directory (either a folder or file's parent)
+                base_path = input_path if input_path.is_dir() else input_path.parent
+                settings = get_pdf_settings(input_path=file_path, file_type=file_type, base_path=base_path)
                 suffix_config = get_suffix_config()
                 suffix = suffix_config.get(file_type, "")
                 
@@ -255,17 +257,17 @@ def convert(
                     converted_pdf = None
                     
                     if file_type == "word":
-                        word_converter.convert(file_path, target_file, settings)
+                        word_converter.convert(file_path, target_file, settings, base_path=base_path)
                         converted_pdf = target_file
                         success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "powerpoint":
-                        ppt_converter.convert(file_path, target_file, settings)
+                        ppt_converter.convert(file_path, target_file, settings, base_path=base_path)
                         converted_pdf = target_file
                         success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "excel":
-                        excel_converter.convert(file_path, target_file, settings, on_progress=progress_callback)
+                        excel_converter.convert(file_path, target_file, settings, on_progress=progress_callback, base_path=base_path)
                         converted_pdf = target_file
                         success_count += 1
                     elif file_type == "pdf":

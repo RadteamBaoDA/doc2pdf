@@ -433,13 +433,19 @@ def convert(
                     f.write(f"    Error:  {error_msg}\n\n")
             console.print(f"Error report: [bold]{error_path}[/bold]")
         
-        # Copy error files to separate folder
+        # Copy error files to separate folder (preserving input folder structure)
         if reporting_config.copy_error_files.enabled and failed_files:
             errors_dir = output_path / reporting_config.copy_error_files.target_dir
             errors_dir.mkdir(parents=True, exist_ok=True)
             for input_file, _, _ in failed_files:
                 try:
-                    dest = errors_dir / input_file.name
+                    # Preserve folder structure relative to input_path
+                    if input_path.is_dir():
+                        rel_path = input_file.relative_to(input_path)
+                        dest = errors_dir / rel_path
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dest = errors_dir / input_file.name
                     shutil.copy2(input_file, dest)
                 except Exception as copy_err:
                     logger.warning(f"Could not copy error file {input_file.name}: {copy_err}")

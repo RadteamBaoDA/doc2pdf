@@ -5,7 +5,7 @@ import shutil
 import threading
 import msvcrt
 import atexit
-from .utils.process_manager import ProcessRegistry
+from .utils.process_manager import ProcessRegistry, kill_office_processes
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -147,6 +147,9 @@ def convert(
 
     # Log config path
     logger.info(f"Using configuration file: {get_config_path().resolve()}")
+
+    # Kill any existing Office processes before starting
+    kill_office_processes()
 
     files = get_files(input_path)
     

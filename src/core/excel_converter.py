@@ -163,7 +163,7 @@ class ExcelConverter(Converter):
                             
                             # Insert file path row if enabled (before last row)
                             if sheet_excel_settings.is_write_file_path:
-                                last_row = self._insert_file_path_row(sheet, input_file, last_row, last_col)
+                                last_row = self._insert_file_path_row(sheet, input_file, last_row, last_col, base_path)
                             
                             last_col_alpha = self._col_num_to_letter(last_col)
 
@@ -220,9 +220,16 @@ class ExcelConverter(Converter):
                                     final_sheets_to_process.append(new_sheet)
                             else:
                                 # Standard Mode
+                                # Skip empty sheets
+                                if last_row == 0 or last_col == 0:
+                                    logger.info(f"Skipping empty sheet: {sheet.Name}")
+                                    skipped_sheets.append(sheet.Name)
+                                    if on_progress:
+                                        on_progress(sheet_weight)
+                                    continue
+                                    
                                 # Set print area to avoid printing 1000 blank pages of formatting
-                                if last_row > 0:
-                                    sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
+                                sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
                                 
                                 self._apply_page_setup(
                                     sheet, 
@@ -722,7 +729,7 @@ class ExcelConverter(Converter):
         except Exception as e:
             logger.warning(f"Could not insert OCR sheet name label for '{sheet_name}': {e}")
 
-    def _insert_file_path_row(self, sheet, file_path: Path, last_row: int, last_col: int) -> int:
+    def _insert_file_path_row(self, sheet, file_path: Path, last_row: int, last_col: int, base_path: Optional[Path] = None) -> int:
         """
         Insert a new row before the last row and add the file path centered.
         
@@ -731,6 +738,7 @@ class ExcelConverter(Converter):
             file_path: Absolute path of the file being converted
             last_row: The last row index with content
             last_col: The last column index with content
+            base_path: Optional root directory to calculate relative path
             
         Returns:
             The updated last_row after insertion
@@ -749,16 +757,27 @@ class ExcelConverter(Converter):
             # Calculate center column
             center_col = max(1, (last_col + 1) // 2)
             
+            # Calculate path to display
+            display_path = ""
+            if base_path:
+                try:
+                    rel_path = file_path.resolve().relative_to(base_path.resolve())
+                    display_path = "/" + rel_path.as_posix()
+                except ValueError:
+                    display_path = str(file_path.resolve())
+            else:
+                display_path = str(file_path.resolve())
+            
             # Set file path in center cell
             cell = sheet.Cells(insert_row, center_col)
-            cell.Value = str(file_path.resolve())
+            cell.Value = display_path
             
             # Format: Italic, slightly smaller font
             cell.Font.Italic = True
             cell.Font.Size = 10
             cell.HorizontalAlignment = -4108  # xlCenter
             
-            logger.debug(f"Inserted file path at row {insert_row} for '{sheet.Name}'")
+            logger.debug(f"Inserted file path '{display_path}' at row {insert_row} for '{sheet.Name}'")
             
             return last_row + 1  # Return updated last_row
             
@@ -946,9 +965,10 @@ class ExcelConverter(Converter):
 
     def _find_longest_text_column(self, sheet, search_last_row: int, search_last_col: int) -> Tuple[int, int, float]:
         """
-        Find text that extends beyond column width using fast row sampling.
+        Find text that extends beyond column width using row sampling.
         
-        Only samples first 20 and last 20 rows for speed.
+        Handles merged cells by calculating the total width of the merge area.
+        Samples first N, last N, and middle rows for better coverage.
         
         Returns:
             Tuple of (extended_col, max_text_length, required_extra_width_points)
@@ -957,14 +977,14 @@ class ExcelConverter(Converter):
         max_text_len = 0
         required_extra_width = 0.0
         
-        AVG_CHAR_WIDTH_POINTS = 7.0
+        AVG_CHAR_WIDTH_POINTS = 7.2
         DEFAULT_COL_WIDTH = 64.0
-        SAMPLE_ROWS = 20  # Only sample first/last N rows
+        SAMPLE_ROWS = 50
         
         try:
-            max_cols = min(search_last_col + 10, 30)  # Limited columns
+            max_cols = search_last_col + 20 
             
-            # Get column widths (quick)
+            # Cache column widths
             col_widths = []
             for col_idx in range(1, max_cols + 1):
                 try:
@@ -972,52 +992,76 @@ class ExcelConverter(Converter):
                 except Exception:
                     col_widths.append(DEFAULT_COL_WIDTH)
             
-            # Sample rows: first N and last N rows only
-            rows_to_check = []
-            
-            # First N rows
+            # Select rows to check
+            rows_to_check = set()
             for r in range(1, min(SAMPLE_ROWS + 1, search_last_row + 1)):
-                rows_to_check.append(r)
+                rows_to_check.add(r)
+            for r in range(max(1, search_last_row - SAMPLE_ROWS + 1), search_last_row + 1):
+                rows_to_check.add(r)
+            if search_last_row > SAMPLE_ROWS * 3:
+                mid = search_last_row // 2
+                for r in range(max(1, mid - 5), min(search_last_row, mid + 5)):
+                    rows_to_check.add(r)
             
-            # Last N rows (if not overlapping with first)
-            if search_last_row > SAMPLE_ROWS * 2:
-                for r in range(max(1, search_last_row - SAMPLE_ROWS + 1), search_last_row + 1):
-                    if r not in rows_to_check:
-                        rows_to_check.append(r)
+            check_list = sorted(list(rows_to_check))
             
-            # Read each sample row individually (faster than full grid)
-            for row_idx in rows_to_check:
+            for row_idx in check_list:
                 try:
                     row_range = sheet.Range(
                         sheet.Cells(row_idx, 1),
-                        sheet.Cells(row_idx, max_cols)
+                        sheet.Cells(row_idx, min(max_cols, search_last_col + 10))
                     )
                     row_values = row_range.Value
                     
-                    # Handle single cell
-                    if not isinstance(row_values, tuple):
+                    if row_values is None:
+                        continue
+
+                    if isinstance(row_values, tuple):
+                        if isinstance(row_values[0], tuple):
+                            row_values = row_values[0]
+                    else:
                         row_values = (row_values,)
-                    elif isinstance(row_values[0], tuple):
-                        row_values = row_values[0]  # Flatten nested tuple
                     
                     for col_idx, value in enumerate(row_values, start=1):
-                        if value is None:
+                        if value is None or not isinstance(value, (str, float, int)):
                             continue
                         
                         text = str(value)
                         text_len = len(text)
                         
-                        if text_len > 20:  # Only care about long text
+                        if text_len > 15:
                             estimated_width = text_len * AVG_CHAR_WIDTH_POINTS
-                            base_width = col_widths[col_idx - 1] if col_idx <= len(col_widths) else DEFAULT_COL_WIDTH
+                            
+                            # Check if this cell is merged and calculate merged width
+                            try:
+                                cell = sheet.Cells(row_idx, col_idx)
+                                merge_area = cell.MergeArea
+                                if merge_area.Columns.Count > 1:
+                                    # Sum widths of all merged columns
+                                    base_width = 0.0
+                                    merge_start_col = merge_area.Column
+                                    merge_end_col = merge_start_col + merge_area.Columns.Count - 1
+                                    for mc in range(merge_start_col, merge_end_col + 1):
+                                        if mc <= len(col_widths):
+                                            base_width += col_widths[mc - 1]
+                                        else:
+                                            base_width += DEFAULT_COL_WIDTH
+                                    # The extended column should start after the merge area
+                                    effective_col = merge_end_col
+                                else:
+                                    base_width = col_widths[col_idx - 1] if col_idx <= len(col_widths) else DEFAULT_COL_WIDTH
+                                    effective_col = col_idx
+                            except Exception:
+                                base_width = col_widths[col_idx - 1] if col_idx <= len(col_widths) else DEFAULT_COL_WIDTH
+                                effective_col = col_idx
                             
                             if estimated_width > base_width:
                                 overflow = estimated_width - base_width
-                                # Calculate extended column
-                                extended_col = col_idx
+                                
+                                extended_col = effective_col
                                 accumulated = 0.0
-                                for nc in range(col_idx, min(col_idx + 15, len(col_widths))):
-                                    accumulated += col_widths[nc] if nc < len(col_widths) else DEFAULT_COL_WIDTH
+                                for nc in range(effective_col, len(col_widths)):
+                                    accumulated += col_widths[nc]
                                     extended_col = nc + 1
                                     if accumulated >= overflow:
                                         break
@@ -1031,10 +1075,10 @@ class ExcelConverter(Converter):
                     continue
             
             if max_text_len > 0:
-                logger.debug(f"Sheet '{sheet.Name}' text overflow: {max_text_len} chars extends to col {max_text_extended_col}")
+                logger.debug(f"Sheet '{sheet.Name}' text overflow detected: {max_text_len} chars extending to col {max_text_extended_col}")
                         
         except Exception as e:
-            logger.debug(f"Text sampling failed: {e}")
+            logger.debug(f"Text overflow detection sampling failed: {e}")
         
         return max_text_extended_col, max_text_len, required_extra_width
 
@@ -1110,7 +1154,7 @@ class ExcelConverter(Converter):
                     bounds_source = "PageBreaks"
                 
                 # Priority 3b: Detect longest text and extend bounds if needed
-                text_col, text_len, extra_width = self._find_longest_text_column(sheet, last_row, last_col)
+                text_col, text_len, overflow_extra_width = self._find_longest_text_column(sheet, last_row, last_col)
                 if text_col > last_col:
                     logger.info(f"Sheet '{sheet.Name}' extending column bound from {last_col} to {text_col} for text overflow")
                     last_col = text_col
@@ -1129,11 +1173,9 @@ class ExcelConverter(Converter):
                     total_width_points += 64.0  # Default column width
             
             # Add extra width for text overflow if detected
-            if bounds_source != "PrintArea":
-                _, _, extra_width = self._find_longest_text_column(sheet, last_row, last_col)
-                if extra_width > 0:
-                    total_width_points += extra_width
-                    logger.debug(f"Added {extra_width:.1f}pt for text overflow")
+            if bounds_source != "PrintArea" and overflow_extra_width > 0:
+                total_width_points += overflow_extra_width
+                logger.debug(f"Added {overflow_extra_width:.1f}pt for text overflow")
             
             # Sum height of each row (in points)
             total_height_points = 0.0

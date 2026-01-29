@@ -8,6 +8,7 @@ Features:
 - Metadata headers (sheet name, row range, filename)
 """
 import sys
+import time
 from pathlib import Path
 from typing import Optional, List, Tuple, Literal, Callable
 import win32com.client
@@ -96,6 +97,8 @@ class ExcelConverter(Converter):
         logger.info(f"Converting '{input_file.name}' to PDF...")
         logger.debug(f"Settings: {settings}")
 
+        start_time = time.time()
+        
         # Ensure CoInitialize is called for this thread
         pythoncom.CoInitialize()
         
@@ -218,7 +221,9 @@ class ExcelConverter(Converter):
                     # Export to PDF
                     if final_sheets_to_process:
                         self._export_to_pdf(workbook, final_sheets_to_process, str(out_file), settings)
-                        logger.success(f"Successfully converted: {out_file}")
+                        elapsed = time.time() - start_time
+                        mins, secs = divmod(int(elapsed), 60)
+                        logger.success(f"Successfully converted: {out_file} [{mins:02d}:{secs:02d}]")
                     else:
                         logger.warning("No content to export.")
                     
@@ -853,87 +858,98 @@ class ExcelConverter(Converter):
 
     def _find_longest_text_column(self, sheet, search_last_row: int, search_last_col: int) -> Tuple[int, int, float]:
         """
-        Find the cell containing the longest text and calculate required width.
+        Find text that extends beyond column width using fast row sampling.
         
-        This handles cases where a narrow column contains very long text 
-        that would overflow beyond its column width.
+        Only samples first 20 and last 20 rows for speed.
         
-        Args:
-            sheet: Excel Worksheet object
-            search_last_row: Maximum row to search
-            search_last_col: Maximum column to search (from Cells.Find)
-            
         Returns:
             Tuple of (extended_col, max_text_length, required_extra_width_points)
-            where extended_col is the column needed to fit all text.
         """
+        max_text_extended_col = 0
         max_text_len = 0
-        max_text_col = 0
-        max_text_row = 0
         required_extra_width = 0.0
         
-        # Average character width in points (approximate for standard fonts)
-        # Default Excel font is typically 11pt Calibri, ~7 points per character
         AVG_CHAR_WIDTH_POINTS = 7.0
+        DEFAULT_COL_WIDTH = 64.0
+        SAMPLE_ROWS = 20  # Only sample first/last N rows
         
         try:
-            # Limit search to reasonable bounds to avoid performance issues
-            max_rows_to_check = min(search_last_row, 1000)
-            max_cols_to_check = min(search_last_col + 10, 100)  # Check a few columns beyond detected
+            max_cols = min(search_last_col + 10, 30)  # Limited columns
             
-            for row_idx in range(1, max_rows_to_check + 1):
-                for col_idx in range(1, max_cols_to_check + 1):
-                    try:
-                        cell = sheet.Cells(row_idx, col_idx)
-                        value = cell.Value
-                        
-                        # Only check string values
+            # Get column widths (quick)
+            col_widths = []
+            for col_idx in range(1, max_cols + 1):
+                try:
+                    col_widths.append(sheet.Columns(col_idx).Width)
+                except Exception:
+                    col_widths.append(DEFAULT_COL_WIDTH)
+            
+            # Sample rows: first N and last N rows only
+            rows_to_check = []
+            
+            # First N rows
+            for r in range(1, min(SAMPLE_ROWS + 1, search_last_row + 1)):
+                rows_to_check.append(r)
+            
+            # Last N rows (if not overlapping with first)
+            if search_last_row > SAMPLE_ROWS * 2:
+                for r in range(max(1, search_last_row - SAMPLE_ROWS + 1), search_last_row + 1):
+                    if r not in rows_to_check:
+                        rows_to_check.append(r)
+            
+            # Read each sample row individually (faster than full grid)
+            for row_idx in rows_to_check:
+                try:
+                    row_range = sheet.Range(
+                        sheet.Cells(row_idx, 1),
+                        sheet.Cells(row_idx, max_cols)
+                    )
+                    row_values = row_range.Value
+                    
+                    # Handle single cell
+                    if not isinstance(row_values, tuple):
+                        row_values = (row_values,)
+                    elif isinstance(row_values[0], tuple):
+                        row_values = row_values[0]  # Flatten nested tuple
+                    
+                    for col_idx, value in enumerate(row_values, start=1):
                         if value is None:
                             continue
                         
                         text = str(value)
                         text_len = len(text)
                         
-                        if text_len > max_text_len:
-                            max_text_len = text_len
-                            max_text_col = col_idx
-                            max_text_row = row_idx
+                        if text_len > 20:  # Only care about long text
+                            estimated_width = text_len * AVG_CHAR_WIDTH_POINTS
+                            base_width = col_widths[col_idx - 1] if col_idx <= len(col_widths) else DEFAULT_COL_WIDTH
                             
-                            # Calculate if text overflows column
-                            try:
-                                col_width = sheet.Columns(col_idx).Width
-                                # Check if cell is part of a merged area
-                                merge_area = cell.MergeArea
-                                if merge_area and merge_area.Columns.Count > 1:
-                                    # Merged cell - use total width of merged area
-                                    col_width = merge_area.Width
-                                    # Update column to rightmost of merge
-                                    max_text_col = merge_area.Column + merge_area.Columns.Count - 1
+                            if estimated_width > base_width:
+                                overflow = estimated_width - base_width
+                                # Calculate extended column
+                                extended_col = col_idx
+                                accumulated = 0.0
+                                for nc in range(col_idx, min(col_idx + 15, len(col_widths))):
+                                    accumulated += col_widths[nc] if nc < len(col_widths) else DEFAULT_COL_WIDTH
+                                    extended_col = nc + 1
+                                    if accumulated >= overflow:
+                                        break
                                 
-                                estimated_text_width = text_len * AVG_CHAR_WIDTH_POINTS
-                                
-                                if estimated_text_width > col_width:
-                                    # Text overflows - calculate how many additional columns needed
-                                    overflow = estimated_text_width - col_width
-                                    if overflow > required_extra_width:
-                                        required_extra_width = overflow
-                                        
-                            except Exception:
-                                pass
-                                
-                    except Exception:
-                        continue
+                                if extended_col > max_text_extended_col:
+                                    max_text_extended_col = extended_col
+                                    max_text_len = text_len
+                                    required_extra_width = overflow
+                                    
+                except Exception:
+                    continue
             
             if max_text_len > 0:
-                logger.debug(
-                    f"Sheet '{sheet.Name}' longest text: {max_text_len} chars at R{max_text_row}C{max_text_col}, "
-                    f"extra width needed: {required_extra_width:.1f}pt"
-                )
+                logger.debug(f"Sheet '{sheet.Name}' text overflow: {max_text_len} chars extends to col {max_text_extended_col}")
                         
         except Exception as e:
-            logger.debug(f"Could not find longest text: {e}")
+            logger.debug(f"Text sampling failed: {e}")
         
-        return max_text_col, max_text_len, required_extra_width
+        return max_text_extended_col, max_text_len, required_extra_width
+
 
     def _get_content_dimensions_points(self, sheet) -> Tuple[float, float, int, int]:
         """

@@ -74,6 +74,7 @@ class ExcelSettings:
     metadata_header: bool = True  # Print header: sheet name | row range | filename
     min_shrink_factor: float = 0.8  # Minimum allowed scaling factor before error (default 0.8 = 80%)
     ocr_sheet_name_label: bool = False  # Insert sheet name as large text in row 1 for OCR
+    is_write_file_path: bool = False  # Insert file path row before last row
 
 @dataclass
 class SummaryReportSettings:
@@ -151,7 +152,7 @@ class PDFConversionSettings:
         # Excel settings can be in nested 'excel' key OR at top level
         excel_data = data.get("excel", {})
         # Also check for top-level excel settings (flat structure)
-        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor", "ocr_sheet_name_label"]
+        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor", "ocr_sheet_name_label", "is_write_file_path"]
         for key in top_level_excel_keys:
             if key in data:
                 # Top-level (flat) settings override nested 'excel' settings

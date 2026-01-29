@@ -145,6 +145,11 @@ class ExcelConverter(Converter):
                         # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
                         # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
                         content_width, content_height, last_row, last_col = self._get_content_dimensions_points(sheet)
+                        
+                        # Insert file path row if enabled (before last row)
+                        if sheet_excel_settings.is_write_file_path:
+                            last_row = self._insert_file_path_row(sheet, input_file, last_row, last_col)
+                        
                         last_col_alpha = self._col_num_to_letter(last_col)
 
                         # Check for Chunking
@@ -677,6 +682,49 @@ class ExcelConverter(Converter):
         except Exception as e:
             logger.warning(f"Could not insert OCR sheet name label for '{sheet_name}': {e}")
 
+    def _insert_file_path_row(self, sheet, file_path: Path, last_row: int, last_col: int) -> int:
+        """
+        Insert a new row before the last row and add the file path centered.
+        
+        Args:
+            sheet: Excel Worksheet object
+            file_path: Absolute path of the file being converted
+            last_row: The last row index with content
+            last_col: The last column index with content
+            
+        Returns:
+            The updated last_row after insertion
+        """
+        try:
+            if last_row < 2:
+                # Sheet too small, insert at row 2
+                insert_row = 2
+            else:
+                # Insert before last row
+                insert_row = last_row
+            
+            # Insert new row
+            sheet.Rows(insert_row).Insert()
+            
+            # Calculate center column
+            center_col = max(1, (last_col + 1) // 2)
+            
+            # Set file path in center cell
+            cell = sheet.Cells(insert_row, center_col)
+            cell.Value = str(file_path.resolve())
+            
+            # Format: Italic, slightly smaller font
+            cell.Font.Italic = True
+            cell.Font.Size = 10
+            cell.HorizontalAlignment = -4108  # xlCenter
+            
+            logger.debug(f"Inserted file path at row {insert_row} for '{sheet.Name}'")
+            
+            return last_row + 1  # Return updated last_row
+            
+        except Exception as e:
+            logger.warning(f"Could not insert file path row for '{sheet.Name}': {e}")
+            return last_row
 
     def _col_num_to_letter(self, n: int) -> str:
         """Convert 1-based column number to Excel column letter (e.g. 1->A, 27->AA)."""

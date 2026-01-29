@@ -98,6 +98,7 @@ pdf_settings:
       settings:
         excel:
           row_dimensions: 0  # Fit all on one page
+          is_write_file_path: true  # Insert file path before last row
 
     # Example: Data sheets with fixed rows per page
     - sheet_name: "*Data*"

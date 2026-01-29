@@ -763,83 +763,283 @@ class ExcelConverter(Converter):
             logger.error(f"Failed to export to PDF: {e}")
             raise
 
+    def _get_print_area_bounds(self, sheet) -> Tuple[int, int]:
+        """
+        Get bounds from existing PrintArea if set by user.
+        
+        This respects user-defined print area settings which have highest priority.
+        
+        Returns:
+            Tuple of (last_row, last_col) from PrintArea, or (0, 0) if not set.
+        """
+        try:
+            print_area = sheet.PageSetup.PrintArea
+            if print_area and print_area.strip():
+                # PrintArea format: "$A$1:$Z$100" or "A1:Z100"
+                # Parse the end cell to get bounds
+                import re
+                # Remove sheet name prefix if present (e.g., "Sheet1!$A$1:$Z$100")
+                if '!' in print_area:
+                    print_area = print_area.split('!')[-1]
+                
+                # Match pattern like $A$1:$Z$100 or A1:Z100
+                match = re.search(r':?\$?([A-Z]+)\$?(\d+)$', print_area.upper())
+                if match:
+                    col_letters = match.group(1)
+                    row_num = int(match.group(2))
+                    
+                    # Convert column letters to number (A=1, Z=26, AA=27, etc.)
+                    col_num = 0
+                    for char in col_letters:
+                        col_num = col_num * 26 + (ord(char) - ord('A') + 1)
+                    
+                    logger.debug(f"Sheet '{sheet.Name}' has PrintArea set: {print_area} -> Row={row_num}, Col={col_num}")
+                    return row_num, col_num
+        except Exception as e:
+            logger.debug(f"Could not parse PrintArea: {e}")
+        
+        return 0, 0
+    
+    def _get_page_break_bounds(self, sheet) -> Tuple[int, int]:
+        """
+        Get bounds from vertical/horizontal page breaks if set.
+        
+        This uses the rightmost vertical page break as the column bound.
+        
+        Returns:
+            Tuple of (last_row, last_col) from page breaks, or (0, 0) if none.
+        """
+        last_row = 0
+        last_col = 0
+        
+        try:
+            # Check VPageBreaks (vertical page breaks define column boundaries)
+            v_breaks = sheet.VPageBreaks
+            if v_breaks and v_breaks.Count > 0:
+                # Get the rightmost break location
+                max_break_col = 0
+                for i in range(1, v_breaks.Count + 1):
+                    try:
+                        break_loc = v_breaks(i).Location
+                        if break_loc and break_loc.Column > max_break_col:
+                            max_break_col = break_loc.Column
+                    except Exception:
+                        continue
+                if max_break_col > 0:
+                    last_col = max_break_col - 1  # Break is BEFORE this column
+                    logger.debug(f"Sheet '{sheet.Name}' VPageBreak found at column {max_break_col}")
+        except Exception as e:
+            logger.debug(f"Could not read VPageBreaks: {e}")
+        
+        try:
+            # Check HPageBreaks (horizontal page breaks define row boundaries)
+            h_breaks = sheet.HPageBreaks
+            if h_breaks and h_breaks.Count > 0:
+                max_break_row = 0
+                for i in range(1, h_breaks.Count + 1):
+                    try:
+                        break_loc = h_breaks(i).Location
+                        if break_loc and break_loc.Row > max_break_row:
+                            max_break_row = break_loc.Row
+                    except Exception:
+                        continue
+                if max_break_row > 0:
+                    last_row = max_break_row - 1  # Break is BEFORE this row
+                    logger.debug(f"Sheet '{sheet.Name}' HPageBreak found at row {max_break_row}")
+        except Exception as e:
+            logger.debug(f"Could not read HPageBreaks: {e}")
+        
+        return last_row, last_col
+
+    def _find_longest_text_column(self, sheet, search_last_row: int, search_last_col: int) -> Tuple[int, int, float]:
+        """
+        Find the cell containing the longest text and calculate required width.
+        
+        This handles cases where a narrow column contains very long text 
+        that would overflow beyond its column width.
+        
+        Args:
+            sheet: Excel Worksheet object
+            search_last_row: Maximum row to search
+            search_last_col: Maximum column to search (from Cells.Find)
+            
+        Returns:
+            Tuple of (extended_col, max_text_length, required_extra_width_points)
+            where extended_col is the column needed to fit all text.
+        """
+        max_text_len = 0
+        max_text_col = 0
+        max_text_row = 0
+        required_extra_width = 0.0
+        
+        # Average character width in points (approximate for standard fonts)
+        # Default Excel font is typically 11pt Calibri, ~7 points per character
+        AVG_CHAR_WIDTH_POINTS = 7.0
+        
+        try:
+            # Limit search to reasonable bounds to avoid performance issues
+            max_rows_to_check = min(search_last_row, 1000)
+            max_cols_to_check = min(search_last_col + 10, 100)  # Check a few columns beyond detected
+            
+            for row_idx in range(1, max_rows_to_check + 1):
+                for col_idx in range(1, max_cols_to_check + 1):
+                    try:
+                        cell = sheet.Cells(row_idx, col_idx)
+                        value = cell.Value
+                        
+                        # Only check string values
+                        if value is None:
+                            continue
+                        
+                        text = str(value)
+                        text_len = len(text)
+                        
+                        if text_len > max_text_len:
+                            max_text_len = text_len
+                            max_text_col = col_idx
+                            max_text_row = row_idx
+                            
+                            # Calculate if text overflows column
+                            try:
+                                col_width = sheet.Columns(col_idx).Width
+                                # Check if cell is part of a merged area
+                                merge_area = cell.MergeArea
+                                if merge_area and merge_area.Columns.Count > 1:
+                                    # Merged cell - use total width of merged area
+                                    col_width = merge_area.Width
+                                    # Update column to rightmost of merge
+                                    max_text_col = merge_area.Column + merge_area.Columns.Count - 1
+                                
+                                estimated_text_width = text_len * AVG_CHAR_WIDTH_POINTS
+                                
+                                if estimated_text_width > col_width:
+                                    # Text overflows - calculate how many additional columns needed
+                                    overflow = estimated_text_width - col_width
+                                    if overflow > required_extra_width:
+                                        required_extra_width = overflow
+                                        
+                            except Exception:
+                                pass
+                                
+                    except Exception:
+                        continue
+            
+            if max_text_len > 0:
+                logger.debug(
+                    f"Sheet '{sheet.Name}' longest text: {max_text_len} chars at R{max_text_row}C{max_text_col}, "
+                    f"extra width needed: {required_extra_width:.1f}pt"
+                )
+                        
+        except Exception as e:
+            logger.debug(f"Could not find longest text: {e}")
+        
+        return max_text_col, max_text_len, required_extra_width
+
     def _get_content_dimensions_points(self, sheet) -> Tuple[float, float, int, int]:
         """
         Calculate total content width and height in points by summing column widths.
         
-        Flow:
-        1. Get current cols in sheet (find last column with data)
-        2. Get size of each column in points (Excel uses points internally)
-        3. Calculate total points
-        4. Convert to inches for page sizing
-        5. Return as max_width
+        Priority order for determining bounds:
+        1. PrintArea (if set by user) - highest priority
+        2. Page breaks (VPageBreaks/HPageBreaks)
+        3. Cells.Find + longest text detection (fallback)
         
         Returns (max_width_points, max_height_points, last_row, last_col).
         """
         max_width = 0.0
         max_height = 0.0
         
-        # Screen DPI assumption for pixel conversion (standard 96 DPI)
-        PIXELS_PER_INCH = 96.0
         POINTS_PER_INCH = 72.0
         
         try:
-            # 1. Find TRUE Last Row and Column (using Cells.Find)
             last_row = 1
             last_col = 1
+            bounds_source = "default"
             
-            try:
-                last_row_cell = sheet.Cells.Find(
-                    What="*",
-                    After=sheet.Range("A1"),
-                    LookIn=-4163,  # xlValues
-                    LookAt=2,      # xlPart
-                    SearchOrder=self.xlByRows,
-                    SearchDirection=self.xlPrevious
-                )
-                if last_row_cell:
-                    last_row = last_row_cell.Row
-            except Exception:
-                last_row = sheet.UsedRange.Rows.Count
+            # Priority 1: Check for PrintArea
+            print_row, print_col = self._get_print_area_bounds(sheet)
+            if print_row > 0 and print_col > 0:
+                last_row = print_row
+                last_col = print_col
+                bounds_source = "PrintArea"
+                logger.info(f"Sheet '{sheet.Name}' using PrintArea bounds: Row={last_row}, Col={last_col}")
+            else:
+                # Priority 2: Check for page breaks
+                break_row, break_col = self._get_page_break_bounds(sheet)
+                if break_row > 0 or break_col > 0:
+                    bounds_source = "PageBreaks"
+                
+                # Priority 3: Use Cells.Find for base detection
+                try:
+                    last_row_cell = sheet.Cells.Find(
+                        What="*",
+                        After=sheet.Range("A1"),
+                        LookIn=-4163,  # xlValues
+                        LookAt=2,      # xlPart
+                        SearchOrder=self.xlByRows,
+                        SearchDirection=self.xlPrevious
+                    )
+                    if last_row_cell:
+                        last_row = last_row_cell.Row
+                except Exception:
+                    last_row = sheet.UsedRange.Rows.Count
+                
+                try:
+                    last_col_cell = sheet.Cells.Find(
+                        What="*",
+                        After=sheet.Range("A1"),
+                        LookIn=-4163,  # xlValues
+                        LookAt=2,      # xlPart
+                        SearchOrder=self.xlByColumns,
+                        SearchDirection=self.xlPrevious
+                    )
+                    if last_col_cell:
+                        last_col = last_col_cell.Column
+                except Exception:
+                    last_col = sheet.UsedRange.Columns.Count
+                
+                # Apply page break bounds if they are larger
+                if break_row > last_row:
+                    last_row = break_row
+                if break_col > last_col:
+                    last_col = break_col
+                    bounds_source = "PageBreaks"
+                
+                # Priority 3b: Detect longest text and extend bounds if needed
+                text_col, text_len, extra_width = self._find_longest_text_column(sheet, last_row, last_col)
+                if text_col > last_col:
+                    logger.info(f"Sheet '{sheet.Name}' extending column bound from {last_col} to {text_col} for text overflow")
+                    last_col = text_col
+                    bounds_source = "TextOverflow"
             
-            try:
-                last_col_cell = sheet.Cells.Find(
-                    What="*",
-                    After=sheet.Range("A1"),
-                    LookIn=-4163,  # xlValues
-                    LookAt=2,      # xlPart
-                    SearchOrder=self.xlByColumns,
-                    SearchDirection=self.xlPrevious
-                )
-                if last_col_cell:
-                    last_col = last_col_cell.Column
-            except Exception:
-                last_col = sheet.UsedRange.Columns.Count
+            logger.debug(f"Sheet '{sheet.Name}' bounds source: {bounds_source}")
             
-            # 2. Sum width of each column (in points)
-            # Excel's Column.Width property returns width in points
+            # Sum width of each column (in points)
             total_width_points = 0.0
             
             for col_idx in range(1, last_col + 1):
                 try:
-                    # sheet.Columns(col_idx).Width returns width in points
                     col_width = sheet.Columns(col_idx).Width
                     total_width_points += col_width
                 except Exception:
-                    # Fallback: assume default column width (~64 points = 8.43 characters at 7.5pt/char)
-                    total_width_points += 64.0
+                    total_width_points += 64.0  # Default column width
             
-            # 3. Sum height of each row (in points)
+            # Add extra width for text overflow if detected
+            if bounds_source != "PrintArea":
+                _, _, extra_width = self._find_longest_text_column(sheet, last_row, last_col)
+                if extra_width > 0:
+                    total_width_points += extra_width
+                    logger.debug(f"Added {extra_width:.1f}pt for text overflow")
+            
+            # Sum height of each row (in points)
             total_height_points = 0.0
             
             for row_idx in range(1, last_row + 1):
                 try:
-                    # sheet.Rows(row_idx).Height returns height in points
                     row_height = sheet.Rows(row_idx).Height
                     total_height_points += row_height
                 except Exception:
-                    # Fallback: assume default row height (~15 points)
-                    total_height_points += 15.0
+                    total_height_points += 15.0  # Default row height
             
             max_width = total_width_points
             max_height = total_height_points
@@ -850,7 +1050,7 @@ class ExcelConverter(Converter):
                 f"Rows=1-{last_row}, Total Height={total_height_points:.1f}pt ({total_height_points/POINTS_PER_INCH:.2f}in)"
             )
             
-            # 4. Expand for Shapes (Charts, Images) - they might extend beyond cell content
+            # Expand for Shapes (Charts, Images)
             for shape in sheet.Shapes:
                 try:
                     shape_right = shape.Left + shape.Width
@@ -862,7 +1062,6 @@ class ExcelConverter(Converter):
                     if shape_bottom > max_height:
                         max_height = shape_bottom
                     
-                    # Also update row/col indices if shape extends beyond
                     try:
                         br_cell = shape.BottomRightCell
                         if br_cell:

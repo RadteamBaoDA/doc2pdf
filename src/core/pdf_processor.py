@@ -5,11 +5,14 @@ Features:
 - Auto-detect content bounds and trim whitespace
 - Non-destructive cropping via CropBox manipulation
 - License-friendly (BSD/MIT) implementation suitable for enterprise use
+- Parallel processing for improved performance
 """
 
 from pathlib import Path
-from typing import Optional, List, Union
-import math
+from typing import Optional, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
+import os
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
@@ -21,9 +24,22 @@ from pdfminer.layout import (
 
 from ..utils.logger import logger
 
+# Default thread pool size for parallel processing
+_DEFAULT_WORKERS = min(8, (os.cpu_count() or 4))
+
 
 class PDFProcessor:
     """Post-processing utilities for PDF files using pypdf and pdfminer."""
+    
+    def __init__(self, max_workers: Optional[int] = None):
+        """
+        Initialize PDFProcessor.
+        
+        Args:
+            max_workers: Maximum number of threads for parallel processing.
+                        Defaults to min(8, cpu_count).
+        """
+        self.max_workers = max_workers or _DEFAULT_WORKERS
     
     def trim_whitespace(
         self, 
@@ -35,7 +51,7 @@ class PDFProcessor:
         Auto-detect content bounds and crop PDF to remove whitespace.
         
         Algorithm:
-        1. Analyze content bounds using pdfminer
+        1. Analyze content bounds using pdfminer (parallel processing)
         2. Calculate union rectangle of all content (filtering outliers)
         3. Apply crop using pypdf
         
@@ -62,50 +78,57 @@ class PDFProcessor:
         try:
             # 1. Open PDF with pypdf for modification
             reader = PdfReader(str(pdf_path))
+            num_pages = len(reader.pages)
             
-            # 2. Extract layout analysis with pdfminer
-            # extract_pages yields LTPage objects
-            layout_pages = list(extract_pages(str(pdf_path)))
+            # 2. Extract layout pages and page dimensions for parallel processing
+            layout_pages: List[Optional[LTPage]] = []
+            page_dimensions: List[Tuple[float, float]] = []
             
-            if len(layout_pages) != len(reader.pages):
-                logger.warning(
-                    f"Page count mismatch: pypdf={len(reader.pages)}, "
-                    f"pdfminer={len(layout_pages)}. Trimming may be inaccurate."
-                )
-            
+            layout_iter = iter(extract_pages(str(pdf_path)))
             for i, page in enumerate(reader.pages):
-                # Match logical page from pdfminer
-                lt_page = layout_pages[i] if i < len(layout_pages) else None
+                # Collect layout page
+                lt_page = None
+                try:
+                    lt_page = next(layout_iter)
+                except StopIteration:
+                    logger.warning(f"pdfminer page exhausted at page {i+1}")
+                layout_pages.append(lt_page)
                 
-                # Get existing dimensions from pypdf
-                # mediabox is [ll_x, ll_y, ur_x, ur_y]
+                # Collect page dimensions
                 mb = page.mediabox
-                page_width = project_float(mb.width)
-                page_height = project_float(mb.height)
-                
-                # Detect content bounds
-                content_rect = self._detect_content_bounds(lt_page, page_width, page_height) if lt_page else None
+                page_dimensions.append((_to_float(mb.width), _to_float(mb.height)))
+            
+            del layout_iter
+            
+            # 3. Parallel content bounds detection
+            content_rects = self._detect_bounds_parallel(layout_pages, page_dimensions)
+            
+            # Free layout pages memory after bounds detection
+            del layout_pages
+            gc.collect()
+            
+            # 4. Apply crops sequentially (must maintain page order)
+            for i, page in enumerate(reader.pages):
+                content_rect = content_rects[i]
+                mb = page.mediabox
                 
                 if content_rect:
-                    # content_rect is (x0, y0, x1, y1)
                     c_x0, c_y0, c_x1, c_y1 = content_rect
                     
                     # Add margin padding
-                    # Ensure we don't go outside existing MediaBox
-                    new_x0 = max(project_float(mb.left), c_x0 - margin)
-                    new_y0 = max(project_float(mb.bottom), c_y0 - margin)
-                    new_x1 = min(project_float(mb.right), c_x1 + margin)
-                    new_y1 = min(project_float(mb.top), c_y1 + margin)
+                    new_x0 = max(_to_float(mb.left), c_x0 - margin)
+                    new_y0 = max(_to_float(mb.bottom), c_y0 - margin)
+                    new_x1 = min(_to_float(mb.right), c_x1 + margin)
+                    new_y1 = min(_to_float(mb.top), c_y1 + margin)
                     
-                    # Sanity check: If resulting box is basically the whole page, skips
-                    current_w = project_float(mb.width)
-                    current_h = project_float(mb.height)
+                    # Sanity check: If resulting box is basically the whole page, skip
+                    current_w = _to_float(mb.width)
+                    current_h = _to_float(mb.height)
                     new_w = new_x1 - new_x0
                     new_h = new_y1 - new_y0
                     
                     if new_w < current_w * 0.95 or new_h < current_h * 0.95:
                         # Apply CropBox
-                        # pypdf RectangleObject expects (x, y, x, y) or list
                         page.cropbox = RectangleObject((new_x0, new_y0, new_x1, new_y1))
                         modified = True
                         logger.debug(
@@ -137,16 +160,68 @@ class PDFProcessor:
             else:
                 logger.info(f"No whitespace trimming needed for '{pdf_path.name}'")
                 if target_path != pdf_path:
-                    # If user requested explicit output path, verify we copy original?
-                    # The CLI usually implies a conversion pipeline.
-                    # Just copy original if needed, or do nothing.
                     pass
 
         except Exception as e:
             logger.error(f"Failed to trim whitespace: {e}")
             raise
+        finally:
+            # Final cleanup
+            gc.collect()
 
         return target_path
+
+    def _detect_bounds_parallel(
+        self, 
+        layout_pages: List[Optional[LTPage]], 
+        page_dimensions: List[Tuple[float, float]]
+    ) -> List[Optional[Tuple[float, float, float, float]]]:
+        """
+        Detect content bounds for multiple pages in parallel.
+        
+        Args:
+            layout_pages: List of pdfminer LTPage objects
+            page_dimensions: List of (width, height) tuples
+            
+        Returns:
+            List of content rectangles (x0, y0, x1, y1) or None for each page
+        """
+        num_pages = len(layout_pages)
+        results: List[Optional[Tuple[float, float, float, float]]] = [None] * num_pages
+        
+        # For small PDFs, process sequentially (thread overhead not worth it)
+        if num_pages <= 2:
+            for i, (lt_page, dims) in enumerate(zip(layout_pages, page_dimensions)):
+                if lt_page:
+                    results[i] = self._detect_content_bounds(lt_page, dims[0], dims[1])
+            return results
+        
+        # Parallel processing for larger PDFs
+        def process_page(args: Tuple[int, Optional[LTPage], Tuple[float, float]]) -> Tuple[int, Optional[tuple]]:
+            idx, lt_page, (width, height) = args
+            if lt_page is None:
+                return (idx, None)
+            return (idx, self._detect_content_bounds(lt_page, width, height))
+        
+        # Prepare work items
+        work_items = [
+            (i, layout_pages[i], page_dimensions[i]) 
+            for i in range(num_pages)
+        ]
+        
+        # Process in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(process_page, item): item[0] for item in work_items}
+            
+            for future in as_completed(futures):
+                try:
+                    idx, rect = future.result()
+                    results[idx] = rect
+                except Exception as e:
+                    page_idx = futures[future]
+                    logger.warning(f"Failed to detect bounds for page {page_idx + 1}: {e}")
+        
+        return results
 
     def _detect_content_bounds(self, lt_page: LTPage, page_width: float, page_height: float) -> Optional[tuple]:
         """
@@ -252,6 +327,6 @@ class SimpleRect:
     def area(self): return self.width * self.height
 
 
-def project_float(val):
+def _to_float(val):
     """Safely convert pypdf float objects to python float"""
     return float(val)

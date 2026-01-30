@@ -6,7 +6,7 @@ class Converter(Protocol):
     """
     Protocol for document converters.
     """
-    def convert(self, input_path: Path, output_path: Optional[Path] = None, settings: Optional[PDFConversionSettings] = None) -> Path:
+    def convert(self, input_path: Path, output_path: Optional[Path] = None, settings: Optional[PDFConversionSettings] = None, base_path: Optional[Path] = None) -> Path:
         """
         Convert a document to PDF.
         

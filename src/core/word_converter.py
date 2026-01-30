@@ -25,7 +25,7 @@ wdOrientLandscape = 1
 wdDoNotSaveChanges = 0
 
 class WordConverter(Converter):
-    def convert(self, input_path: Path, output_path: Optional[Path] = None, settings: Optional[PDFConversionSettings] = None) -> Path:
+    def convert(self, input_path: Path, output_path: Optional[Path] = None, settings: Optional[PDFConversionSettings] = None, base_path: Optional[Path] = None) -> Path:
         input_file = input_path.resolve()
         if not input_file.exists():
             raise FileNotFoundError(f"Input file not found: {input_file}")

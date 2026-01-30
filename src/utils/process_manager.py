@@ -1,6 +1,46 @@
 import threading
+import subprocess
 from typing import Set, Any
 from .logger import logger
+
+# Office process names to kill before conversion
+OFFICE_PROCESSES = ["EXCEL.EXE", "WINWORD.EXE", "POWERPNT.EXE"]
+
+
+def kill_office_processes() -> int:
+    """
+    Force kill all running Microsoft Office processes before conversion.
+    
+    Returns:
+        Number of processes killed.
+    """
+    killed_count = 0
+    
+    for process_name in OFFICE_PROCESSES:
+        try:
+            # Use taskkill to force terminate the process
+            result = subprocess.run(
+                ["taskkill", "/F", "/IM", process_name],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            if result.returncode == 0:
+                killed_count += 1
+                logger.info(f"Terminated process: {process_name}")
+            elif "not found" not in result.stderr.lower() and "no tasks" not in result.stdout.lower():
+                # Only log if it's an actual error, not just "process not running"
+                logger.debug(f"Process {process_name} not running or already terminated")
+                
+        except Exception as e:
+            logger.warning(f"Failed to kill {process_name}: {e}")
+    
+    if killed_count > 0:
+        logger.info(f"Killed {killed_count} Office process(es) before conversion")
+    
+    return killed_count
+
 
 class ProcessRegistry:
     """

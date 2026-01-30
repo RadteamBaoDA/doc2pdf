@@ -8,6 +8,7 @@ Features:
 - Metadata headers (sheet name, row range, filename)
 """
 import sys
+import time
 from pathlib import Path
 from typing import Optional, List, Tuple, Literal, Callable
 import win32com.client
@@ -49,6 +50,11 @@ xlPrintNoComments = -4142
 xlSheetVisible = -1
 
 
+class OversizedSheetError(Exception):
+    """Raised when a sheet is too large to print at acceptable quality."""
+    pass
+
+
 class ExcelConverter(Converter):
     """
     Converter for Excel documents (.xlsx, .xls, .xlsm, .xlsb) to PDF.
@@ -68,22 +74,30 @@ class ExcelConverter(Converter):
     xlByColumns = 2
     xlPrevious = 2
     
-    def convert(self, input_file: Path, output_file: Path, settings: PDFConversionSettings, on_progress: Optional[Callable[[float], None]] = None) -> None:
+    def convert(
+        self, 
+        input_path: Path, 
+        output_path: Optional[Path] = None, 
+        settings: Optional[PDFConversionSettings] = None,
+        on_progress: Optional[Callable[[float], None]] = None,
+        base_path: Optional[Path] = None
+    ) -> Path:
         """
         Convert Excel file to PDF using COM automation.
         
         Args:
-            input_file: Path to source Excel file
-            output_file: Path to destination PDF file
+            input_path: Path to source Excel file
+            output_path: Path to destination PDF file
             settings: PDFConversionSettings object containing conversion configuration
             on_progress: Optional callback for partial progress (0.0 to 1.0)
+            base_path: Optional root directory for relative path matching
         """    
-        input_file = input_file.resolve()
+        input_file = input_path.resolve()
         if not input_file.exists():
             raise FileNotFoundError(f"Input file not found: {input_file}")
             
-        if output_file:
-            out_file = output_file.resolve()
+        if output_path:
+            out_file = output_path.resolve()
         else:
             out_file = input_file.with_suffix(".pdf")
             
@@ -96,6 +110,8 @@ class ExcelConverter(Converter):
         logger.info(f"Converting '{input_file.name}' to PDF...")
         logger.debug(f"Settings: {settings}")
 
+        start_time = time.time()
+        
         # Ensure CoInitialize is called for this thread
         pythoncom.CoInitialize()
         
@@ -126,99 +142,126 @@ class ExcelConverter(Converter):
                     sheet_weight = 1.0 / total_sheets if total_sheets > 0 else 0
                     
                     # Apply page setup and process chunks
+                    skipped_sheets = []  # Track skipped oversized sheets
                     for sheet in sheets_to_export:
-                        # Get sheet-specific settings
-                        # Note: Arguments are (sheet_name, base_settings, input_path)
-                        sheet_settings = get_excel_sheet_settings(sheet.Name, settings, input_file)
-                        sheet_excel_settings = sheet_settings.excel or excel_settings
-                        
-                        logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
-                        
-                        # Insert OCR sheet name label if enabled
-                        if sheet_excel_settings.ocr_sheet_name_label:
-                            self._insert_sheet_name_label(sheet, sheet.Name)
-                        
-                        # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
-                        # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
-                        # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
-                        content_width, content_height, last_row, last_col = self._get_content_dimensions_points(sheet)
-                        last_col_alpha = self._col_num_to_letter(last_col)
+                        try:
+                            # Get sheet-specific settings
+                            # Note: Arguments are (sheet_name, base_settings, input_path, base_path)
+                            sheet_settings = get_excel_sheet_settings(sheet.Name, settings, input_file, base_path)
+                            sheet_excel_settings = sheet_settings.excel or excel_settings
+                            
+                            logger.debug(f"Sheet '{sheet.Name}' settings: row_dimensions={sheet_excel_settings.row_dimensions}")
+                            
+                            # Insert OCR sheet name label if enabled
+                            if sheet_excel_settings.ocr_sheet_name_label:
+                                self._insert_sheet_name_label(sheet, sheet.Name)
+                            
+                            # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
+                            # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
+                            # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
+                            content_width, content_height, last_row, last_col = self._get_content_dimensions_points(sheet)
+                            
+                            # Insert file path row if enabled (before last row)
+                            if sheet_excel_settings.is_write_file_path:
+                                last_row = self._insert_file_path_row(sheet, input_file, last_row, last_col, base_path)
+                            
+                            last_col_alpha = self._col_num_to_letter(last_col)
 
-                        # Check for Chunking
-                        row_lim = sheet_excel_settings.row_dimensions
-                        if row_lim and row_lim > 0:
-                            # Chunking Mode
-                            # Use true last_row instead of UsedRange
-                            if last_row == 0:
-                                # Empty sheet
-                                if on_progress: on_progress(sheet_weight)
-                                continue
+                            # Check for Chunking
+                            row_lim = sheet_excel_settings.row_dimensions
+                            if row_lim and row_lim > 0:
+                                # Chunking Mode
+                                # Use true last_row instead of UsedRange
+                                if last_row == 0:
+                                    # Empty sheet
+                                    if on_progress: on_progress(sheet_weight)
+                                    continue
+                                    
+                                chunks = (last_row + row_lim - 1) // row_lim
+                                logger.info(f"Splitting sheet '{sheet.Name}' into {chunks} chunks (Rows: {row_lim})")
                                 
-                            chunks = (last_row + row_lim - 1) // row_lim
-                            logger.info(f"Splitting sheet '{sheet.Name}' into {chunks} chunks (Rows: {row_lim})")
-                            
-                            # Weight for each chunk
-                            chunk_weight = sheet_weight / chunks
-                            
-                            for i in range(chunks):
-                                start_row = i * row_lim + 1
-                                end_row = min((i + 1) * row_lim, last_row)
+                                # Weight for each chunk
+                                chunk_weight = sheet_weight / chunks
                                 
-                                # Copy sheet to end
-                                last_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                sheet.Copy(None, last_sheet)
-                                new_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                
-                                temp_sheets_to_delete.append(new_sheet)
-                                
-                                # Set Print Area explicitly to True content columns
-                                # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
-                                new_sheet.PageSetup.PrintArea = f"$A${start_row}:${last_col_alpha}${end_row}"
-                                
-                                # Create chunk settings
-                                chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
-                                chunk_settings.row_dimensions = 0 # Force 1 page tall
+                                for i in range(chunks):
+                                    start_row = i * row_lim + 1
+                                    end_row = min((i + 1) * row_lim, last_row)
+                                    
+                                    # Copy sheet to end
+                                    last_sheet = workbook.Sheets(workbook.Sheets.Count)
+                                    sheet.Copy(None, last_sheet)
+                                    new_sheet = workbook.Sheets(workbook.Sheets.Count)
+                                    
+                                    temp_sheets_to_delete.append(new_sheet)
+                                    
+                                    # Set Print Area explicitly to True content columns
+                                    # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
+                                    new_sheet.PageSetup.PrintArea = f"$A${start_row}:${last_col_alpha}${end_row}"
+                                    
+                                    # Create chunk settings
+                                    chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
+                                    chunk_settings.row_dimensions = 0 # Force 1 page tall
+                                    
+                                    self._apply_page_setup(
+                                        new_sheet, 
+                                        chunk_settings, 
+                                        input_file.name, 
+                                        last_col, 
+                                        content_width_points=content_width
+                                    )
+
+                                    if on_progress:
+                                        on_progress(chunk_weight)
+                                    
+                                    if sheet_excel_settings.metadata_header:
+                                        center_text = f"{start_row}-{end_row}"
+                                        self._apply_metadata_header(new_sheet, sheet_excel_settings, input_file.name, center_text, left_text=sheet.Name)
+                                        
+                                    final_sheets_to_process.append(new_sheet)
+                            else:
+                                # Standard Mode
+                                # Skip empty sheets
+                                if last_row == 0 or last_col == 0:
+                                    logger.info(f"Skipping empty sheet: {sheet.Name}")
+                                    skipped_sheets.append(sheet.Name)
+                                    if on_progress:
+                                        on_progress(sheet_weight)
+                                    continue
+                                    
+                                # Set print area to avoid printing 1000 blank pages of formatting
+                                sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
                                 
                                 self._apply_page_setup(
-                                    new_sheet, 
-                                    chunk_settings, 
+                                    sheet, 
+                                    sheet_excel_settings, 
                                     input_file.name, 
                                     last_col, 
                                     content_width_points=content_width
                                 )
-
-                                if on_progress:
-                                    on_progress(chunk_weight)
-                                
                                 if sheet_excel_settings.metadata_header:
-                                    center_text = f"{start_row}-{end_row}"
-                                    self._apply_metadata_header(new_sheet, sheet_excel_settings, input_file.name, center_text, left_text=sheet.Name)
-                                    
-                                final_sheets_to_process.append(new_sheet)
-                        else:
-                            # Standard Mode
-                            # Set print area to avoid printing 1000 blank pages of formatting
-                            if last_row > 0:
-                                sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
-                            
-                            self._apply_page_setup(
-                                sheet, 
-                                sheet_excel_settings, 
-                                input_file.name, 
-                                last_col, 
-                                content_width_points=content_width
-                            )
-                            if sheet_excel_settings.metadata_header:
-                                self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
-                            final_sheets_to_process.append(sheet)
-                            
+                                    self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
+                                final_sheets_to_process.append(sheet)
+                                
+                                if on_progress:
+                                    on_progress(sheet_weight)
+                        
+                        except OversizedSheetError:
+                            # Sheet is too large and configured to skip
+                            skipped_sheets.append(sheet.Name)
                             if on_progress:
                                 on_progress(sheet_weight)
+                            continue
+                    
+                    # Log skipped sheets summary
+                    if skipped_sheets:
+                        logger.warning(f"Skipped {len(skipped_sheets)} oversized sheet(s): {', '.join(skipped_sheets)}")
                     
                     # Export to PDF
                     if final_sheets_to_process:
                         self._export_to_pdf(workbook, final_sheets_to_process, str(out_file), settings)
-                        logger.success(f"Successfully converted: {out_file}")
+                        elapsed = time.time() - start_time
+                        mins, secs = divmod(int(elapsed), 60)
+                        logger.success(f"Successfully converted: {out_file} [{mins:02d}:{secs:02d}]")
                     else:
                         logger.warning("No content to export.")
                     
@@ -560,10 +603,17 @@ class ExcelConverter(Converter):
                  if shrink_factor < excel_settings.min_shrink_factor:
                      err_msg = (
                         f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for the largest supported paper '{name_to_try}' ({limit_to_try:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold. Cannot convert safely."
+                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold."
                      )
-                     logger.error(err_msg)
-                     raise ValueError(err_msg)
+                     # Check oversized_action config
+                     if excel_settings.oversized_action == "skip":
+                         logger.warning(f"{err_msg} Skipping sheet.")
+                         raise OversizedSheetError(err_msg)
+                     elif excel_settings.oversized_action == "warn":
+                         logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
+                     else:  # "error" (default)
+                         logger.error(err_msg)
+                         raise ValueError(err_msg)
                  else:
                      logger.warning(f"Sheet '{sheet.Name}': Content slightly larger than {name_to_try}. Shrinking to fit (Factor: {shrink_factor:.2f})")
             elif paper_set_success and oversized:
@@ -573,10 +623,17 @@ class ExcelConverter(Converter):
                  if shrink_factor < excel_settings.min_shrink_factor:
                      err_msg = (
                         f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for selected paper '{selected_name}' ({limit_width:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold. Cannot convert safely."
+                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold."
                      )
-                     logger.error(err_msg)
-                     raise ValueError(err_msg)
+                     # Check oversized_action config
+                     if excel_settings.oversized_action == "skip":
+                         logger.warning(f"{err_msg} Skipping sheet.")
+                         raise OversizedSheetError(err_msg)
+                     elif excel_settings.oversized_action == "warn":
+                         logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
+                     else:  # "error" (default)
+                         logger.error(err_msg)
+                         raise ValueError(err_msg)
 
             # 4. Final Setup
             page_setup.Zoom = False
@@ -672,6 +729,61 @@ class ExcelConverter(Converter):
         except Exception as e:
             logger.warning(f"Could not insert OCR sheet name label for '{sheet_name}': {e}")
 
+    def _insert_file_path_row(self, sheet, file_path: Path, last_row: int, last_col: int, base_path: Optional[Path] = None) -> int:
+        """
+        Insert a new row before the last row and add the file path centered.
+        
+        Args:
+            sheet: Excel Worksheet object
+            file_path: Absolute path of the file being converted
+            last_row: The last row index with content
+            last_col: The last column index with content
+            base_path: Optional root directory to calculate relative path
+            
+        Returns:
+            The updated last_row after insertion
+        """
+        try:
+            if last_row < 2:
+                # Sheet too small, insert at row 2
+                insert_row = 2
+            else:
+                # Insert before last row
+                insert_row = last_row
+            
+            # Insert new row
+            sheet.Rows(insert_row).Insert()
+            
+            # Calculate center column
+            center_col = max(1, (last_col + 1) // 2)
+            
+            # Calculate path to display
+            display_path = ""
+            if base_path:
+                try:
+                    rel_path = file_path.resolve().relative_to(base_path.resolve())
+                    display_path = "/" + rel_path.as_posix()
+                except ValueError:
+                    display_path = str(file_path.resolve())
+            else:
+                display_path = str(file_path.resolve())
+            
+            # Set file path in center cell
+            cell = sheet.Cells(insert_row, center_col)
+            cell.Value = display_path
+            
+            # Format: Italic, slightly smaller font
+            cell.Font.Italic = True
+            cell.Font.Size = 10
+            cell.HorizontalAlignment = -4108  # xlCenter
+            
+            logger.debug(f"Inserted file path '{display_path}' at row {insert_row} for '{sheet.Name}'")
+            
+            return last_row + 1  # Return updated last_row
+            
+        except Exception as e:
+            logger.warning(f"Could not insert file path row for '{sheet.Name}': {e}")
+            return last_row
 
     def _col_num_to_letter(self, n: int) -> str:
         """Convert 1-based column number to Excel column letter (e.g. 1->A, 27->AA)."""
@@ -853,87 +965,123 @@ class ExcelConverter(Converter):
 
     def _find_longest_text_column(self, sheet, search_last_row: int, search_last_col: int) -> Tuple[int, int, float]:
         """
-        Find the cell containing the longest text and calculate required width.
+        Find text that extends beyond column width using row sampling.
         
-        This handles cases where a narrow column contains very long text 
-        that would overflow beyond its column width.
+        Handles merged cells by calculating the total width of the merge area.
+        Samples first N, last N, and middle rows for better coverage.
         
-        Args:
-            sheet: Excel Worksheet object
-            search_last_row: Maximum row to search
-            search_last_col: Maximum column to search (from Cells.Find)
-            
         Returns:
             Tuple of (extended_col, max_text_length, required_extra_width_points)
-            where extended_col is the column needed to fit all text.
         """
+        max_text_extended_col = 0
         max_text_len = 0
-        max_text_col = 0
-        max_text_row = 0
         required_extra_width = 0.0
         
-        # Average character width in points (approximate for standard fonts)
-        # Default Excel font is typically 11pt Calibri, ~7 points per character
-        AVG_CHAR_WIDTH_POINTS = 7.0
+        AVG_CHAR_WIDTH_POINTS = 7.2
+        DEFAULT_COL_WIDTH = 64.0
+        SAMPLE_ROWS = 50
         
         try:
-            # Limit search to reasonable bounds to avoid performance issues
-            max_rows_to_check = min(search_last_row, 1000)
-            max_cols_to_check = min(search_last_col + 10, 100)  # Check a few columns beyond detected
+            max_cols = search_last_col + 20 
             
-            for row_idx in range(1, max_rows_to_check + 1):
-                for col_idx in range(1, max_cols_to_check + 1):
-                    try:
-                        cell = sheet.Cells(row_idx, col_idx)
-                        value = cell.Value
-                        
-                        # Only check string values
-                        if value is None:
+            # Cache column widths
+            col_widths = []
+            for col_idx in range(1, max_cols + 1):
+                try:
+                    col_widths.append(sheet.Columns(col_idx).Width)
+                except Exception:
+                    col_widths.append(DEFAULT_COL_WIDTH)
+            
+            # Select rows to check
+            rows_to_check = set()
+            for r in range(1, min(SAMPLE_ROWS + 1, search_last_row + 1)):
+                rows_to_check.add(r)
+            for r in range(max(1, search_last_row - SAMPLE_ROWS + 1), search_last_row + 1):
+                rows_to_check.add(r)
+            if search_last_row > SAMPLE_ROWS * 3:
+                mid = search_last_row // 2
+                for r in range(max(1, mid - 5), min(search_last_row, mid + 5)):
+                    rows_to_check.add(r)
+            
+            check_list = sorted(list(rows_to_check))
+            
+            for row_idx in check_list:
+                try:
+                    row_range = sheet.Range(
+                        sheet.Cells(row_idx, 1),
+                        sheet.Cells(row_idx, min(max_cols, search_last_col + 10))
+                    )
+                    row_values = row_range.Value
+                    
+                    if row_values is None:
+                        continue
+
+                    if isinstance(row_values, tuple):
+                        if isinstance(row_values[0], tuple):
+                            row_values = row_values[0]
+                    else:
+                        row_values = (row_values,)
+                    
+                    for col_idx, value in enumerate(row_values, start=1):
+                        if value is None or not isinstance(value, (str, float, int)):
                             continue
                         
                         text = str(value)
                         text_len = len(text)
                         
-                        if text_len > max_text_len:
-                            max_text_len = text_len
-                            max_text_col = col_idx
-                            max_text_row = row_idx
+                        if text_len > 15:
+                            estimated_width = text_len * AVG_CHAR_WIDTH_POINTS
                             
-                            # Calculate if text overflows column
+                            # Check if this cell is merged and calculate merged width
                             try:
-                                col_width = sheet.Columns(col_idx).Width
-                                # Check if cell is part of a merged area
+                                cell = sheet.Cells(row_idx, col_idx)
                                 merge_area = cell.MergeArea
-                                if merge_area and merge_area.Columns.Count > 1:
-                                    # Merged cell - use total width of merged area
-                                    col_width = merge_area.Width
-                                    # Update column to rightmost of merge
-                                    max_text_col = merge_area.Column + merge_area.Columns.Count - 1
-                                
-                                estimated_text_width = text_len * AVG_CHAR_WIDTH_POINTS
-                                
-                                if estimated_text_width > col_width:
-                                    # Text overflows - calculate how many additional columns needed
-                                    overflow = estimated_text_width - col_width
-                                    if overflow > required_extra_width:
-                                        required_extra_width = overflow
-                                        
+                                if merge_area.Columns.Count > 1:
+                                    # Sum widths of all merged columns
+                                    base_width = 0.0
+                                    merge_start_col = merge_area.Column
+                                    merge_end_col = merge_start_col + merge_area.Columns.Count - 1
+                                    for mc in range(merge_start_col, merge_end_col + 1):
+                                        if mc <= len(col_widths):
+                                            base_width += col_widths[mc - 1]
+                                        else:
+                                            base_width += DEFAULT_COL_WIDTH
+                                    # The extended column should start after the merge area
+                                    effective_col = merge_end_col
+                                else:
+                                    base_width = col_widths[col_idx - 1] if col_idx <= len(col_widths) else DEFAULT_COL_WIDTH
+                                    effective_col = col_idx
                             except Exception:
-                                pass
+                                base_width = col_widths[col_idx - 1] if col_idx <= len(col_widths) else DEFAULT_COL_WIDTH
+                                effective_col = col_idx
+                            
+                            if estimated_width > base_width:
+                                overflow = estimated_width - base_width
                                 
-                    except Exception:
-                        continue
+                                extended_col = effective_col
+                                accumulated = 0.0
+                                for nc in range(effective_col, len(col_widths)):
+                                    accumulated += col_widths[nc]
+                                    extended_col = nc + 1
+                                    if accumulated >= overflow:
+                                        break
+                                
+                                if extended_col > max_text_extended_col:
+                                    max_text_extended_col = extended_col
+                                    max_text_len = text_len
+                                    required_extra_width = overflow
+                                    
+                except Exception:
+                    continue
             
             if max_text_len > 0:
-                logger.debug(
-                    f"Sheet '{sheet.Name}' longest text: {max_text_len} chars at R{max_text_row}C{max_text_col}, "
-                    f"extra width needed: {required_extra_width:.1f}pt"
-                )
+                logger.debug(f"Sheet '{sheet.Name}' text overflow detected: {max_text_len} chars extending to col {max_text_extended_col}")
                         
         except Exception as e:
-            logger.debug(f"Could not find longest text: {e}")
+            logger.debug(f"Text overflow detection sampling failed: {e}")
         
-        return max_text_col, max_text_len, required_extra_width
+        return max_text_extended_col, max_text_len, required_extra_width
+
 
     def _get_content_dimensions_points(self, sheet) -> Tuple[float, float, int, int]:
         """
@@ -1006,7 +1154,7 @@ class ExcelConverter(Converter):
                     bounds_source = "PageBreaks"
                 
                 # Priority 3b: Detect longest text and extend bounds if needed
-                text_col, text_len, extra_width = self._find_longest_text_column(sheet, last_row, last_col)
+                text_col, text_len, overflow_extra_width = self._find_longest_text_column(sheet, last_row, last_col)
                 if text_col > last_col:
                     logger.info(f"Sheet '{sheet.Name}' extending column bound from {last_col} to {text_col} for text overflow")
                     last_col = text_col
@@ -1025,11 +1173,9 @@ class ExcelConverter(Converter):
                     total_width_points += 64.0  # Default column width
             
             # Add extra width for text overflow if detected
-            if bounds_source != "PrintArea":
-                _, _, extra_width = self._find_longest_text_column(sheet, last_row, last_col)
-                if extra_width > 0:
-                    total_width_points += extra_width
-                    logger.debug(f"Added {extra_width:.1f}pt for text overflow")
+            if bounds_source != "PrintArea" and overflow_extra_width > 0:
+                total_width_points += overflow_extra_width
+                logger.debug(f"Added {overflow_extra_width:.1f}pt for text overflow")
             
             # Sum height of each row (in points)
             total_height_points = 0.0

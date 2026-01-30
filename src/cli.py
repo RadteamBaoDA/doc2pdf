@@ -5,7 +5,7 @@ import shutil
 import threading
 import msvcrt
 import atexit
-from .utils.process_manager import ProcessRegistry
+from .utils.process_manager import ProcessRegistry, kill_office_processes
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -148,6 +148,9 @@ def convert(
     # Log config path
     logger.info(f"Using configuration file: {get_config_path().resolve()}")
 
+    # Kill any existing Office processes before starting
+    kill_office_processes()
+
     files = get_files(input_path)
     
     if not files:
@@ -226,7 +229,9 @@ def convert(
                 tui_ctx.update_progress(progress)
                 
                 # Get settings
-                settings = get_pdf_settings(input_path=file_path, file_type=file_type)
+                # base_path is the root input directory (either a folder or file's parent)
+                base_path = input_path if input_path.is_dir() else input_path.parent
+                settings = get_pdf_settings(input_path=file_path, file_type=file_type, base_path=base_path)
                 suffix_config = get_suffix_config()
                 suffix = suffix_config.get(file_type, "")
                 
@@ -255,17 +260,17 @@ def convert(
                     converted_pdf = None
                     
                     if file_type == "word":
-                        word_converter.convert(file_path, target_file, settings)
+                        word_converter.convert(file_path, target_file, settings, base_path=base_path)
                         converted_pdf = target_file
                         success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "powerpoint":
-                        ppt_converter.convert(file_path, target_file, settings)
+                        ppt_converter.convert(file_path, target_file, settings, base_path=base_path)
                         converted_pdf = target_file
                         success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "excel":
-                        excel_converter.convert(file_path, target_file, settings, on_progress=progress_callback)
+                        excel_converter.convert(file_path, target_file, settings, on_progress=progress_callback, base_path=base_path)
                         converted_pdf = target_file
                         success_count += 1
                     elif file_type == "pdf":
@@ -433,13 +438,19 @@ def convert(
                     f.write(f"    Error:  {error_msg}\n\n")
             console.print(f"Error report: [bold]{error_path}[/bold]")
         
-        # Copy error files to separate folder
+        # Copy error files to separate folder (preserving input folder structure)
         if reporting_config.copy_error_files.enabled and failed_files:
             errors_dir = output_path / reporting_config.copy_error_files.target_dir
             errors_dir.mkdir(parents=True, exist_ok=True)
             for input_file, _, _ in failed_files:
                 try:
-                    dest = errors_dir / input_file.name
+                    # Preserve folder structure relative to input_path
+                    if input_path.is_dir():
+                        rel_path = input_file.relative_to(input_path)
+                        dest = errors_dir / rel_path
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dest = errors_dir / input_file.name
                     shutil.copy2(input_file, dest)
                 except Exception as copy_err:
                     logger.warning(f"Could not copy error file {input_file.name}: {copy_err}")

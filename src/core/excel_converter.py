@@ -1030,6 +1030,15 @@ class ExcelConverter(Converter):
                         text_len = len(text)
                         
                         if text_len > 15:
+                            # Check if this cell has wrap text enabled - if so, skip overflow detection
+                            try:
+                                cell = sheet.Cells(row_idx, col_idx)
+                                if cell.WrapText:
+                                    # Text wraps within the column, no horizontal overflow
+                                    continue
+                            except Exception:
+                                pass
+                            
                             estimated_width = text_len * AVG_CHAR_WIDTH_POINTS
                             
                             # Check if this cell is merged and calculate merged width
@@ -1075,7 +1084,13 @@ class ExcelConverter(Converter):
                     continue
             
             if max_text_len > 0:
-                logger.debug(f"Sheet '{sheet.Name}' text overflow detected: {max_text_len} chars extending to col {max_text_extended_col}")
+                # Log column widths for debugging
+                col_width_summary = ", ".join([f"Col{i+1}:{col_widths[i]:.1f}pt" for i in range(min(search_last_col, len(col_widths)))])
+                total_width_pts = sum(col_widths[:search_last_col])
+                logger.debug(
+                    f"Sheet '{sheet.Name}' text overflow detected: {max_text_len} chars extending to col {max_text_extended_col}. "
+                    f"Column widths (1-{search_last_col}): [{col_width_summary}], Total: {total_width_pts:.1f}pt ({total_width_pts/72:.2f}in)"
+                )
                         
         except Exception as e:
             logger.debug(f"Text overflow detection sampling failed: {e}")
@@ -1154,11 +1169,16 @@ class ExcelConverter(Converter):
                     bounds_source = "PageBreaks"
                 
                 # Priority 3b: Detect longest text and extend bounds if needed
-                text_col, text_len, overflow_extra_width = self._find_longest_text_column(sheet, last_row, last_col)
-                if text_col > last_col:
-                    logger.info(f"Sheet '{sheet.Name}' extending column bound from {last_col} to {text_col} for text overflow")
-                    last_col = text_col
-                    bounds_source = "TextOverflow"
+                # Skip text overflow detection if VPageBreak defines column boundary
+                overflow_extra_width = 0.0
+                if break_col > 0:
+                    logger.debug(f"Sheet '{sheet.Name}' skipping text overflow detection - VPageBreak defines column boundary at {break_col}")
+                else:
+                    text_col, text_len, overflow_extra_width = self._find_longest_text_column(sheet, last_row, last_col)
+                    if text_col > last_col:
+                        logger.info(f"Sheet '{sheet.Name}' extending column bound from {last_col} to {text_col} for text overflow")
+                        last_col = text_col
+                        bounds_source = "TextOverflow"
             
             logger.debug(f"Sheet '{sheet.Name}' bounds source: {bounds_source}")
             

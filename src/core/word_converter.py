@@ -100,6 +100,7 @@ class WordConverter(Converter):
                     export_args = self._map_settings(settings, str(out_file))
                     
                     # Export
+                    logger.info(f"Exporting '{input_file.name}' to PDF format...")
                     doc.ExportAsFixedFormat(**export_args)
                     
                     logger.success(f"Successfully converted: {out_file}")

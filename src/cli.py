@@ -180,6 +180,9 @@ def convert(
     log_buffer = LogBuffer()
     tui_ctx = TUIContext(log_buffer)
     
+    # Variable to hold Live context reference for sink
+    live_context = None
+    
     # Redirect Logger to TUI Buffer
     def tui_sink(message):
         record = message.record
@@ -189,6 +192,12 @@ def convert(
         log_msg = f"[{color}]{record['time'].strftime('%H:%M:%S')} | {level_name: <8} | {record['message']}[/{color}]"
         log_buffer.write(log_msg)
         tui_ctx.update_logs()
+        # Force immediate refresh if Live context is available
+        if live_context is not None:
+            try:
+                live_context.refresh()
+            except Exception:
+                pass
     
     try:
         tui_level = current_config.get("level", "INFO")
@@ -372,6 +381,9 @@ def convert(
 
     try:
         with Live(tui_ctx.layout, refresh_per_second=10, screen=True) as live:
+            # Store live context for sink
+            live_context = live
+            
             task_id = progress.add_task(f"[cyan]Converting {len(files)} files...", total=len(files))
             
             success_count = 0

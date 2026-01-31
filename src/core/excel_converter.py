@@ -863,6 +863,7 @@ class ExcelConverter(Converter):
 
             if len(sheets) == 1:
                 # Export single sheet directly
+                logger.info(f"Exporting sheet '{sheets[0].Name}' to PDF...")
                 sheets[0].ExportAsFixedFormat(
                     Type=xlTypePDF,
                     Filename=output_path,
@@ -871,6 +872,7 @@ class ExcelConverter(Converter):
                     IgnorePrintAreas=False,
                     OpenAfterPublish=False
                 )
+                logger.debug(f"Sheet '{sheets[0].Name}' exported successfully")
             else:
                 # Multiple sheets: Copy to new temporary workbook iteratively
                 logger.debug(f"Preparing to copy {len(sheets)} sheets to new workbook.")
@@ -904,7 +906,8 @@ class ExcelConverter(Converter):
                             
                     sel_count = temp_wb.Windows(1).SelectedSheets.Count
                     logger.debug(f"Selected {sel_count} sheets for export.")
-                            
+                    
+                    logger.info(f"Exporting {sel_count} sheets to PDF...")
                     temp_wb.ExportAsFixedFormat(
                         Type=xlTypePDF,
                         Filename=output_path,
@@ -913,6 +916,7 @@ class ExcelConverter(Converter):
                         IgnorePrintAreas=False,
                         OpenAfterPublish=False
                     )
+                    logger.debug(f"Multi-sheet export completed successfully")
                 finally:
                     temp_wb.Close(SaveChanges=False)
 

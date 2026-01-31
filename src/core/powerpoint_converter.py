@@ -107,6 +107,7 @@ class PowerPointConverter(Converter):
                     export_args = self._map_settings(settings, str(out_file))
                     
                     # Export to PDF
+                    logger.info(f"Exporting '{input_file.name}' to PDF format...")
                     presentation.ExportAsFixedFormat(**export_args)
                     
                     logger.success(f"Successfully converted: {out_file}")

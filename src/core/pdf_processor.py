@@ -70,7 +70,8 @@ class PDFProcessor:
         # Default: overwrite input file
         target_path = output_path.resolve() if output_path else pdf_path
         
-        logger.info(f"Trimming whitespace from '{pdf_path.name}' (using pypdf/pdfminer)...")
+        logger.info(f"Starting whitespace trimming for '{pdf_path.name}'...")
+        logger.debug(f"Analyzing content bounds (using pypdf/pdfminer)...")
         
         modified = False
         writer = PdfWriter()
@@ -144,6 +145,7 @@ class PDFProcessor:
             
             # Save result
             if modified:
+                logger.info(f"Saving trimmed PDF to disk...")
                 if target_path == pdf_path:
                     # Overwrite
                     temp_path = pdf_path.with_suffix(".tmp.pdf")

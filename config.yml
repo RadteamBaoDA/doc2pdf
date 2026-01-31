@@ -6,6 +6,24 @@
 # ============================================================================
 
 # ============================================================================
+# TIMEOUT CONFIGURATION
+# ============================================================================
+# Controls timeout limits for long-running operations during conversion.
+timeout:
+  # Document parsing timeout (in seconds)
+  # Maximum time allowed for converting a single document (Word, Excel, PowerPoint) to PDF
+  # Default: 3600 seconds (1 hour)
+  # Set to null or 0 to disable timeout
+  document_parsing: 3600
+  
+  # Excel trim timeout (in seconds)
+  # Maximum time allowed for trimming whitespace from Excel-generated PDFs
+  # Default: 3600 seconds (1 hour)
+  # Set to null or 0 to disable timeout
+  excel_trim: 3600
+
+
+# ============================================================================
 # LOGGING CONFIGURATION
 # ============================================================================
 # Controls how the application logs information during conversion.

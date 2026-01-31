@@ -6,6 +6,7 @@ import threading
 import msvcrt
 import atexit
 from .utils.process_manager import ProcessRegistry, kill_office_processes
+from .utils.timeout import run_with_timeout, TimeoutError
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -32,7 +33,8 @@ from .core.pdf_processor import PDFProcessor
 from .utils.logger import setup_logger, logger
 from .config import (
     get_logging_config, get_pdf_settings, get_suffix_config, 
-    get_reporting_config, get_post_processing_config, get_pdf_handling_config, FileType,
+    get_reporting_config, get_post_processing_config, get_pdf_handling_config, 
+    get_timeout_config, FileType,
     set_config_path, get_config_path
 )
 
@@ -166,6 +168,11 @@ def convert(
     post_proc_config = get_post_processing_config()
     should_trim = trim if trim is not None else post_proc_config.trim_whitespace.enabled
     trim_margin_value = trim_margin if trim_margin is not None else post_proc_config.trim_whitespace.margin
+    
+    # Get timeout settings
+    timeout_config = get_timeout_config()
+    document_timeout = timeout_config.document_parsing
+    excel_trim_timeout = timeout_config.excel_trim
 
     # TUI Setup
     from .tui import LogBuffer, TUIContext
@@ -260,17 +267,29 @@ def convert(
                     converted_pdf = None
                     
                     if file_type == "word":
-                        word_converter.convert(file_path, target_file, settings, base_path=base_path)
+                        run_with_timeout(
+                            word_converter.convert,
+                            document_timeout,
+                            file_path, target_file, settings, base_path=base_path
+                        )
                         converted_pdf = target_file
                         success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "powerpoint":
-                        ppt_converter.convert(file_path, target_file, settings, base_path=base_path)
+                        run_with_timeout(
+                            ppt_converter.convert,
+                            document_timeout,
+                            file_path, target_file, settings, base_path=base_path
+                        )
                         converted_pdf = target_file
                         success_count += 1
                         progress.advance(task_id, advance=1)
                     elif file_type == "excel":
-                        excel_converter.convert(file_path, target_file, settings, on_progress=progress_callback, base_path=base_path)
+                        run_with_timeout(
+                            excel_converter.convert,
+                            document_timeout,
+                            file_path, target_file, settings, on_progress=progress_callback, base_path=base_path
+                        )
                         converted_pdf = target_file
                         success_count += 1
                     elif file_type == "pdf":
@@ -311,12 +330,27 @@ def convert(
                         # Check if file type is included in trim settings
                         if file_type in post_proc_config.trim_whitespace.include:
                             try:
-                                pdf_processor.trim_whitespace(converted_pdf, margin=trim_margin_value)
+                                # Apply timeout specifically for Excel trimming
+                                trim_timeout = excel_trim_timeout if file_type == "excel" else None
+                                run_with_timeout(
+                                    pdf_processor.trim_whitespace,
+                                    trim_timeout,
+                                    converted_pdf, margin=trim_margin_value
+                                )
+                            except TimeoutError as timeout_err:
+                                logger.error(f"Trimming timed out for {converted_pdf.name}: {timeout_err}")
                             except Exception as trim_err:
                                 logger.warning(f"Failed to trim whitespace from {converted_pdf.name}: {trim_err}")
                         else:
                             logger.debug(f"Skipping trim for {file_type} file: {file_path.name}")
                         
+                except TimeoutError as timeout_err:
+                    # Thread-safe counter update
+                    fail_count += 1
+                    error_msg = f"Conversion timed out: {timeout_err}"
+                    failed_files.append((file_path, target_file, error_msg))
+                    logger.error(f"Failed to convert {file_path.name}: {error_msg}")
+                    progress.advance(task_id, advance=1)
                 except Exception as e:
                     # Thread-safe counter update
                     fail_count += 1

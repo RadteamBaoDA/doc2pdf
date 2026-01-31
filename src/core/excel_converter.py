@@ -375,11 +375,8 @@ class ExcelConverter(Converter):
                 excel.AskToUpdateLinks = False
                 # Suppress clipboard prompts
                 excel.CutCopyMode = False
-                # Disable print communication errors that might show dialogs
-                try:
-                    excel.PrintCommunication = False
-                except:
-                    pass  # Not available in all Excel versions
+                # NOTE: Do NOT set PrintCommunication=False here!
+                # It prevents PageSetup changes (paper size, headers) from being applied.
                 # Prevent Office feature installation dialogs
                 try:
                     excel.FeatureInstall = 0  # msoFeatureInstallNone
@@ -694,7 +691,20 @@ class ExcelConverter(Converter):
             return False
         
         try:
+            # Disable communication during change
+            try:
+                app.PrintCommunication = False
+            except:
+                pass
+            
             page_setup.PaperSize = paper_enum
+            
+            # Re-enable to commit change
+            try:
+                app.PrintCommunication = True
+            except:
+                pass
+            
             # Verify it was actually set
             if page_setup.PaperSize == paper_enum:
                 return True
@@ -702,6 +712,11 @@ class ExcelConverter(Converter):
                 logger.debug(f"Printer rejected paper size {paper_name} (Enum {paper_enum}). Trying next size...")
                 return False
         except Exception as e:
+            # Ensure PrintCommunication is re-enabled even on error
+            try:
+                app.PrintCommunication = True
+            except:
+                pass
             logger.debug(f"Failed to set paper size to {paper_name}: {e}")
             return False
 
@@ -820,11 +835,7 @@ class ExcelConverter(Converter):
                 app = sheet.Application
                 app.DisplayAlerts = False
                 app.Interactive = False
-                # PrintCommunication=False prevents printer driver dialogs
-                try:
-                    app.PrintCommunication = False
-                except:
-                    pass
+                # NOTE: Keep PrintCommunication=True so PageSetup changes are applied
             except:
                 pass
             
@@ -1016,6 +1027,13 @@ class ExcelConverter(Converter):
             self._safe_set_page_property(page_setup, 'TopMargin', top_margin)
             self._safe_set_page_property(page_setup, 'BottomMargin', margin_points)
             
+            # CRITICAL: Re-enable PrintCommunication to commit all PageSetup changes
+            try:
+                app = sheet.Application
+                app.PrintCommunication = True
+            except:
+                pass
+            
         except ValueError:
             raise
         except Exception as e:
@@ -1052,20 +1070,44 @@ class ExcelConverter(Converter):
         try:
             page_setup = sheet.PageSetup
             
-            # Left header: Sheet name (or custom) - with timeout protection
-            self._safe_set_page_property(page_setup, 'LeftHeader', left_text if left_text else "&A")
+            # Build header values
+            left_val = left_text if left_text else "&A"
+            center_val = center_text
+            right_val = f"{filename} (Page &P)"
             
-            # Center header: Custom text (Row range) or empty
-            self._safe_set_page_property(page_setup, 'CenterHeader', center_text)
+            # Set headers directly (avoid wrapper that may silently fail)
+            try:
+                page_setup.LeftHeader = left_val
+                logger.debug(f"Set LeftHeader = '{left_val}'")
+            except Exception as e:
+                logger.warning(f"Failed to set LeftHeader: {e}")
             
-            # Right header: Filename + Page Number
-            # Format: filename (Page X)
-            self._safe_set_page_property(page_setup, 'RightHeader', f"{filename} (Page &P)")
+            try:
+                page_setup.CenterHeader = center_val
+                logger.debug(f"Set CenterHeader = '{center_val}'")
+            except Exception as e:
+                logger.warning(f"Failed to set CenterHeader: {e}")
+            
+            try:
+                page_setup.RightHeader = right_val
+                logger.debug(f"Set RightHeader = '{right_val}'")
+            except Exception as e:
+                logger.warning(f"Failed to set RightHeader: {e}")
             
             # Clear footers to avoid clutter and potential crop issues
-            self._safe_set_page_property(page_setup, 'RightFooter', "")
-            self._safe_set_page_property(page_setup, 'CenterFooter', "")
-            self._safe_set_page_property(page_setup, 'LeftFooter', "")
+            try:
+                page_setup.RightFooter = ""
+                page_setup.CenterFooter = ""
+                page_setup.LeftFooter = ""
+            except Exception as e:
+                logger.debug(f"Failed to clear footers: {e}")
+            
+            # CRITICAL: Re-enable PrintCommunication to commit header/footer changes
+            try:
+                app = sheet.Application
+                app.PrintCommunication = True
+            except:
+                pass
             
             logger.debug(f"Applied metadata header for sheet '{sheet.Name}' (Center: '{center_text}')")
             
@@ -1301,8 +1343,12 @@ class ExcelConverter(Converter):
             # Ensure dialogs are suppressed before export
             app.DisplayAlerts = False
             app.Interactive = False
+            
+            # CRITICAL: Re-enable PrintCommunication before export
+            # When False, PageSetup changes (headers/footers) are NOT communicated to printer
+            # Must be True for headers/footers to appear in PDF
             try:
-                app.PrintCommunication = False
+                app.PrintCommunication = True
             except:
                 pass
             

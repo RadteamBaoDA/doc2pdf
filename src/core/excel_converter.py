@@ -359,40 +359,26 @@ class ExcelConverter(Converter):
 
     def _safe_quit_excel(self, excel, timeout_seconds: int = 5) -> None:
         """
-        Safely quit Excel application with timeout protection.
+        Safely quit Excel application.
         
-        Excel.Quit() can hang if Excel is stuck in a modal dialog or
-        waiting for printer driver response. This method uses a timeout
-        to prevent indefinite blocking.
+        Note: COM objects are apartment-threaded - threading breaks COM marshaling.
+        This method executes Quit() directly. Ensure Excel settings are properly
+        configured (DisplayAlerts=False, Interactive=False) to prevent modal dialogs.
         
         Args:
             excel: Excel Application COM object
-            timeout_seconds: Maximum time to wait for Quit() to complete
+            timeout_seconds: Ignored (kept for API compatibility)
         """
-        import threading
-        
-        def quit_excel():
+        try:
+            # Ensure DisplayAlerts is off before quitting
             try:
-                # Ensure DisplayAlerts is off before quitting
-                try:
-                    excel.DisplayAlerts = False
-                except:
-                    pass
-                excel.Quit()
-            except Exception as e:
-                logger.debug(f"Excel.Quit() raised: {e}")
-        
-        thread = threading.Thread(target=quit_excel)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout_seconds)
-        
-        if thread.is_alive():
-            logger.warning(f"Excel.Quit() timed out after {timeout_seconds}s - Excel process may need manual termination")
-            # Don't raise - let the process continue, the OS will clean up eventually
-            # or the user can kill it manually
-        else:
+                excel.DisplayAlerts = False
+            except:
+                pass
+            excel.Quit()
             logger.debug("Excel application closed successfully")
+        except Exception as e:
+            logger.debug(f"Excel.Quit() raised: {e}")
 
     def _set_optimal_printer(self, excel) -> None:
         """
@@ -473,10 +459,58 @@ class ExcelConverter(Converter):
                 if sheet.Name != excel_settings.sheet_name:
                     continue
             
+            # Validate that the sheet has a proper PageSetup object
+            # Some sheet types (dialog sheets, macro sheets) may not support PageSetup
+            if not self._has_valid_page_setup(sheet):
+                logger.warning(f"Skipping sheet '{sheet.Name}': PageSetup not supported")
+                continue
+            
             sheets.append(sheet)
             logger.debug(f"Will export sheet: {sheet.Name}")
         
         return sheets
+
+    def _has_valid_page_setup(self, sheet) -> bool:
+        """
+        Check if the sheet has a valid PageSetup object that can be modified.
+        
+        Some sheet types (Chart sheets accessed as Worksheets, Dialog sheets, 
+        Macro 4.0 sheets) may not support standard PageSetup property modifications.
+        The error manifests as properties showing '<unknown>' when accessed.
+        
+        Args:
+            sheet: Excel sheet object to validate
+            
+        Returns:
+            True if PageSetup is valid and modifiable, False otherwise
+        """
+        try:
+            page_setup = sheet.PageSetup
+            if page_setup is None:
+                return False
+            
+            # Try to read a basic property to verify the object is valid
+            # Reading Orientation is a safe test - it should return 1 (Portrait) or 2 (Landscape)
+            # If the PageSetup is invalid, this will raise an exception or return an unusable value
+            orientation = page_setup.Orientation
+            
+            # Check if we got a valid value (int for real COM, MagicMock for tests)
+            # Invalid PageSetup objects typically raise exceptions or return '<unknown>' type
+            if orientation is None:
+                return False
+            
+            # For real COM objects, orientation should be 1 (Portrait) or 2 (Landscape)
+            # For mocks in tests, orientation will be a MagicMock which is fine
+            if isinstance(orientation, int) and orientation not in (1, 2):
+                # Real COM object returned invalid orientation value
+                logger.debug(f"Sheet '{sheet.Name}' has invalid PageSetup.Orientation: {orientation}")
+                return False
+            
+            return True
+        except Exception as e:
+            # If we can't even read the Orientation property, the PageSetup is invalid
+            logger.debug(f"Sheet '{sheet.Name}' PageSetup validation failed: {e}")
+            return False
 
     def _calculate_smart_page_size(
         self, 
@@ -532,135 +566,105 @@ class ExcelConverter(Converter):
 
     def _try_set_paper_size(self, page_setup, paper_enum: int, paper_name: str, timeout_seconds: int = 3) -> bool:
         """
-        Safely attempt to set paper size with timeout protection.
+        Safely attempt to set paper size.
         
-        Some printer drivers can block indefinitely when setting unsupported paper sizes.
-        This method wraps the operation with a timeout to prevent freezing.
+        Note: COM objects are apartment-threaded - threading-based timeout breaks COM.
+        This method executes the paper size assignment directly on the current thread.
         
         Args:
             page_setup: Excel PageSetup object
             paper_enum: Excel paper size constant (e.g., xlPaperA3)
             paper_name: Human-readable paper name for logging
-            timeout_seconds: Maximum time to wait for the operation
+            timeout_seconds: Ignored (kept for API compatibility)
             
         Returns:
             True if paper size was set successfully, False otherwise
         """
-        import threading
-        
-        result = [False]
-        error = [None]
-        
-        def set_paper():
-            try:
-                page_setup.PaperSize = paper_enum
-                # Verify it was actually set
-                if page_setup.PaperSize == paper_enum:
-                    result[0] = True
-                else:
-                    logger.debug(f"Printer rejected paper size {paper_name} (Enum {paper_enum}). Trying next size...")
-            except Exception as e:
-                error[0] = e
-        
-        thread = threading.Thread(target=set_paper)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout_seconds)
-        
-        if thread.is_alive():
-            logger.warning(f"Paper size '{paper_name}' setting timed out after {timeout_seconds}s - printer driver may be unresponsive")
+        # Validate page_setup object before attempting to set paper size
+        if page_setup is None:
+            logger.debug(f"Cannot set paper size to {paper_name}: PageSetup object is None")
             return False
         
-        if error[0]:
-            logger.debug(f"Failed to set paper size to {paper_name}: {error[0]}")
+        # Quick validation: try to access the object type
+        try:
+            _ = page_setup.Application
+        except Exception:
+            logger.debug(f"Cannot set paper size to {paper_name}: PageSetup object is invalid")
             return False
-            
-        return result[0]
+        
+        try:
+            page_setup.PaperSize = paper_enum
+            # Verify it was actually set
+            if page_setup.PaperSize == paper_enum:
+                return True
+            else:
+                logger.debug(f"Printer rejected paper size {paper_name} (Enum {paper_enum}). Trying next size...")
+                return False
+        except Exception as e:
+            logger.debug(f"Failed to set paper size to {paper_name}: {e}")
+            return False
 
     def _safe_com_call(self, func, timeout: int = 10, default=None):
         """
-        Execute a COM call with timeout protection.
+        Execute a COM call safely.
         
-        This is a general-purpose wrapper for any COM operation that might hang.
-        Used for operations like workbook.Close(), sheet.Copy(), ExportAsFixedFormat(), etc.
+        Note: COM objects in Python/pywin32 are apartment-threaded and cannot be
+        accessed from a different thread than the one that created them. Using
+        threading for timeout protection breaks COM marshaling (causes '<unknown>' errors).
+        
+        This method executes the COM call directly on the current thread.
+        For operations that might hang, ensure Excel settings are properly configured
+        (DisplayAlerts=False, Interactive=False, etc.) to prevent modal dialogs.
         
         Args:
             func: Lambda or callable to execute
-            timeout: Maximum time to wait in seconds
-            default: Value to return if timeout or error occurs
+            timeout: Ignored (kept for API compatibility)
+            default: Value to return if error occurs
             
         Returns:
-            Result of func() or default if timed out/failed
+            Result of func() or default if failed
         """
-        import threading
-        
-        result = [default]
-        error = [None]
-        
-        def execute():
-            try:
-                result[0] = func()
-            except Exception as e:
-                error[0] = e
-        
-        thread = threading.Thread(target=execute)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout)
-        
-        if thread.is_alive():
-            logger.warning(f"COM operation timed out after {timeout}s")
-            return default
-        
-        if error[0]:
-            logger.debug(f"COM operation failed: {error[0]}")
-            raise error[0]
-            
-        return result[0]
+        try:
+            return func()
+        except Exception as e:
+            logger.debug(f"COM operation failed: {e}")
+            raise
 
     def _safe_set_page_property(self, page_setup, prop_name: str, value, timeout_seconds: int = 3) -> bool:
         """
-        Safely set a PageSetup property with timeout protection.
+        Safely set a PageSetup property.
         
-        PageSetup property assignments can block indefinitely when the printer
-        driver is unresponsive or Excel is in a modal state. This method wraps
-        the operation with a timeout to prevent freezing.
+        Note: COM objects are apartment-threaded - threading-based timeout breaks COM.
+        This method executes the property assignment directly on the current thread.
         
         Args:
             page_setup: Excel PageSetup object
             prop_name: Name of the property to set (e.g., 'Orientation', 'Zoom')
             value: Value to assign to the property
-            timeout_seconds: Maximum time to wait for the operation
+            timeout_seconds: Ignored (kept for API compatibility)
             
         Returns:
-            True if property was set successfully, False if timed out or failed
+            True if property was set successfully, False if failed
         """
-        import threading
-        
-        result = [False]
-        error = [None]
-        
-        def set_property():
-            try:
-                setattr(page_setup, prop_name, value)
-                result[0] = True
-            except Exception as e:
-                error[0] = e
-        
-        thread = threading.Thread(target=set_property)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout_seconds)
-        
-        if thread.is_alive():
-            logger.warning(f"PageSetup.{prop_name} setting timed out after {timeout_seconds}s - printer driver may be unresponsive")
+        # Validate page_setup object before attempting to set property
+        if page_setup is None:
+            logger.debug(f"Cannot set PageSetup.{prop_name}: PageSetup object is None")
             return False
         
-        if error[0]:
-            logger.debug(f"Failed to set PageSetup.{prop_name}: {error[0]}")
+        # Quick validation: try to access the object type
+        try:
+            # Check if it's a valid COM object by accessing a read-only property
+            _ = page_setup.Application
+        except Exception:
+            logger.debug(f"Cannot set PageSetup.{prop_name}: PageSetup object is invalid")
             return False
-            
-        return result[0]
+        
+        try:
+            setattr(page_setup, prop_name, value)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to set PageSetup.{prop_name}: {e}")
+            return False
 
     def _apply_page_setup(
         self, 

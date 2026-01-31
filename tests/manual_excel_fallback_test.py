@@ -69,6 +69,8 @@ def test_fallback_logic():
             self.LeftFooter = ""
             self.CenterFooter = ""
             self.RightFooter = ""
+            self.BlackAndWhite = False
+            self.Application = MagicMock()  # Required for validation
 
         @property
         def PaperSize(self):

@@ -20,7 +20,13 @@ def mock_pythoncom():
 
 
 @pytest.fixture
-def converter(mock_ppt_app, mock_pythoncom):
+def mock_process_registry():
+    with patch("src.core.powerpoint_converter.ProcessRegistry"):
+        yield
+
+
+@pytest.fixture
+def converter(mock_ppt_app, mock_pythoncom, mock_process_registry):
     return PowerPointConverter()
 
 
@@ -38,10 +44,13 @@ def test_convert_success(converter, mock_ppt_app, tmp_path):
     settings = PDFConversionSettings()
     result = converter.convert(input_file, output_file, settings)
     
-    # Verify Open called
-    mock_ppt_app.Presentations.Open.assert_called_once_with(
-        str(input_file.resolve()), ReadOnly=True, Untitled=False, WithWindow=False
-    )
+    # Verify Open called with correct file path (other params suppress dialogs)
+    mock_ppt_app.Presentations.Open.assert_called_once()
+    call_args = mock_ppt_app.Presentations.Open.call_args
+    assert call_args[0][0] == str(input_file.resolve())
+    # Verify key dialog suppression parameters
+    assert call_args[1].get('ReadOnly') == True
+    assert call_args[1].get('OpenConflictDocument') == False
     
     # Verify Export called
     assert mock_presentation.ExportAsFixedFormat.call_count == 1

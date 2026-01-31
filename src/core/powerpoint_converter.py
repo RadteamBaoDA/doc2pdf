@@ -32,6 +32,15 @@ ppPrintPureBlackAndWhite = 3
 ppSaveChanges = 1
 ppDoNotSaveChanges = 2
 
+# AutomationSecurity constants (msoAutomationSecurity)
+msoAutomationSecurityForceDisable = 3
+msoAutomationSecurityByUI = 2
+msoAutomationSecurityLow = 1
+
+# Alert Level constants
+ppAlertsNone = 2
+ppAlertsAll = 1
+
 
 class PowerPointConverter(Converter):
     """
@@ -80,12 +89,18 @@ class PowerPointConverter(Converter):
             with self._powerpoint_application() as ppt:
                 presentation = None
                 try:
-                    # Open Presentation (ReadOnly for safety)
+                    # Open Presentation with all parameters to suppress dialogs
+                    # FileName: Path to file
+                    # ReadOnly=True: Open read-only for safety
+                    # Untitled=False: Use original title
+                    # WithWindow=False: Don't show window (msoFalse)
+                    # OpenConflictDocument=False: Don't prompt about conflicts
                     presentation = ppt.Presentations.Open(
                         str(input_file), 
                         ReadOnly=True, 
                         Untitled=False, 
-                        WithWindow=False
+                        WithWindow=False,
+                        OpenConflictDocument=False
                     )
                     
                     # Prepare Export Arguments
@@ -115,9 +130,13 @@ class PowerPointConverter(Converter):
         ppt = None
         try:
             ppt = win32com.client.Dispatch("PowerPoint.Application")
-            # Note: PowerPoint doesn't have a Visible property like Word
-            # but setting DisplayAlerts to false can help
-            ppt.DisplayAlerts = False
+            # Suppress ALL alerts and dialogs
+            # ppAlertsNone = 2 suppresses all alerts
+            ppt.DisplayAlerts = ppAlertsNone
+            # Disable macro/automation security prompts
+            ppt.AutomationSecurity = msoAutomationSecurityForceDisable
+            # Disable events that might trigger dialogs
+            ppt.EnableEvents = False
             ProcessRegistry.register(ppt)
             yield ppt
         except Exception as e:

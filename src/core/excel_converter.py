@@ -49,6 +49,16 @@ xlPrintNoComments = -4142
 # Worksheet visibility
 xlSheetVisible = -1
 
+# AutomationSecurity constants (msoAutomationSecurity)
+msoAutomationSecurityForceDisable = 3
+msoAutomationSecurityByUI = 2
+msoAutomationSecurityLow = 1
+
+# CorruptLoad constants - for opening potentially corrupted files
+xlNormalLoad = 0
+xlRepairFile = 1
+xlExtractData = 2
+
 
 class OversizedSheetError(Exception):
     """Raised when a sheet is too large to print at acceptable quality."""
@@ -122,12 +132,37 @@ class ExcelConverter(Converter):
                 final_sheets_to_process = []
                 
                 try:
-                    # Open Workbook (ReadOnly for safety)
+                    # Open Workbook with all parameters to suppress dialogs
+                    # UpdateLinks=0: Don't update/prompt about external links
+                    # ReadOnly=True: Open read-only for safety
+                    # Format=None: Auto-detect delimiter format
+                    # Password="": No password prompt
+                    # WriteResPassword="": No write-reservation password prompt
+                    # IgnoreReadOnlyRecommended=True: Ignore read-only recommendation
+                    # Origin=None: Auto-detect origin
+                    # Delimiter=None: Auto-detect delimiter
+                    # Editable=False: Don't allow editing (no edit prompt)
+                    # Notify=False: Don't notify about file reservation
+                    # Converter=None: Auto-select converter
+                    # AddToMru=False: Don't add to recent files
+                    # Local=True: Use local settings without prompts
+                    # CorruptLoad=xlNormalLoad: Normal load without repair dialog
                     workbook = excel.Workbooks.Open(
                         str(input_file), 
+                        UpdateLinks=0,
                         ReadOnly=True,
-                        UpdateLinks=False,
-                        IgnoreReadOnlyRecommended=True
+                        Format=None,
+                        Password="",
+                        WriteResPassword="",
+                        IgnoreReadOnlyRecommended=True,
+                        Origin=None,
+                        Delimiter=None,
+                        Editable=False,
+                        Notify=False,
+                        Converter=None,
+                        AddToMru=False,
+                        Local=True,
+                        CorruptLoad=xlNormalLoad
                     )
                     
                     # Get sheets to process
@@ -292,8 +327,19 @@ class ExcelConverter(Converter):
         try:
             excel = win32com.client.Dispatch("Excel.Application")
             excel.Visible = False
+            # Suppress ALL alerts and dialogs
             excel.DisplayAlerts = False
             excel.ScreenUpdating = False
+            # Disable macro/automation security prompts
+            excel.AutomationSecurity = msoAutomationSecurityForceDisable
+            # Disable interactive mode - no user prompts
+            excel.Interactive = False
+            # Disable events that might trigger dialogs
+            excel.EnableEvents = False
+            # Don't prompt about links
+            excel.AskToUpdateLinks = False
+            # Suppress clipboard prompts
+            excel.CutCopyMode = False
             
             # Try to set optimal printer
             self._set_optimal_printer(excel)

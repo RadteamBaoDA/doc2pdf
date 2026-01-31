@@ -24,6 +24,19 @@ wdOrientPortrait = 0
 wdOrientLandscape = 1
 wdDoNotSaveChanges = 0
 
+# Alert/Security constants - suppress all dialogs
+wdAlertsNone = 0
+wdAlertsMessageBox = -2
+wdAlertsAll = -1
+
+# AutomationSecurity constants (msoAutomationSecurity)
+msoAutomationSecurityForceDisable = 3
+msoAutomationSecurityByUI = 2
+msoAutomationSecurityLow = 1
+
+# File format constants
+wdOpenFormatAuto = 0  # Let Word detect format automatically
+
 class WordConverter(Converter):
     def convert(self, input_path: Path, output_path: Optional[Path] = None, settings: Optional[PDFConversionSettings] = None, base_path: Optional[Path] = None) -> Path:
         input_file = input_path.resolve()
@@ -47,8 +60,36 @@ class WordConverter(Converter):
             with self._word_application() as word:
                 doc = None
                 try:
-                    # Open Document (ReadOnly to be safe)
-                    doc = word.Documents.Open(str(input_file), ReadOnly=True, Visible=False)
+                    # Open Document with all parameters to suppress dialogs
+                    # ConfirmConversions=False: Don't ask about file format conversion
+                    # ReadOnly=True: Open read-only for safety
+                    # AddToRecentFiles=False: Don't modify recent files list
+                    # PasswordDocument="": No password prompt
+                    # PasswordTemplate="": No template password prompt
+                    # Revert=False: Don't prompt about reverting
+                    # WritePasswordDocument="": No write password prompt
+                    # WritePasswordTemplate="": No template write password prompt
+                    # Format=wdOpenFormatAuto: Auto-detect format without asking
+                    # Visible=False: Don't show document
+                    # OpenConflictDocument=False: Don't prompt about conflicts
+                    # OpenAndRepair=False: Don't show repair dialog
+                    # NoEncodingDialog=True: Don't show encoding selection dialog
+                    doc = word.Documents.Open(
+                        str(input_file),
+                        ConfirmConversions=False,
+                        ReadOnly=True,
+                        AddToRecentFiles=False,
+                        PasswordDocument="",
+                        PasswordTemplate="",
+                        Revert=False,
+                        WritePasswordDocument="",
+                        WritePasswordTemplate="",
+                        Format=wdOpenFormatAuto,
+                        Visible=False,
+                        OpenConflictDocument=False,
+                        OpenAndRepair=False,
+                        NoEncodingDialog=True
+                    )
                     
                     # Apply temporary layout settings if needed (careful with ReadOnly, might need to change ReadOnly=False if we want to change layout before print?)
                     # Actually, changing layout on a ReadOnly doc changes the view in memory, but we can't save. 
@@ -80,7 +121,15 @@ class WordConverter(Converter):
         try:
             word = win32com.client.Dispatch("Word.Application")
             word.Visible = False
-            word.DisplayAlerts = False
+            # Suppress ALL alerts and dialogs
+            word.DisplayAlerts = wdAlertsNone
+            # Disable macro/automation security prompts
+            word.AutomationSecurity = msoAutomationSecurityForceDisable
+            # Disable automatic spell/grammar checking that might trigger dialogs
+            word.Options.CheckSpellingAsYouType = False
+            word.Options.CheckGrammarAsYouType = False
+            # Don't show recent files dialog
+            word.Options.UpdateLinksAtOpen = False
             ProcessRegistry.register(word)
             yield word
         except Exception as e:

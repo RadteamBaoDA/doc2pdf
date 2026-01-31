@@ -17,7 +17,12 @@ def mock_pythoncom():
         yield mock_com
 
 @pytest.fixture
-def converter(mock_word_app, mock_pythoncom):
+def mock_process_registry():
+    with patch("src.core.word_converter.ProcessRegistry"):
+        yield
+
+@pytest.fixture
+def converter(mock_word_app, mock_pythoncom, mock_process_registry):
     return WordConverter()
 
 def test_convert_success(converter, mock_word_app, tmp_path):
@@ -34,10 +39,13 @@ def test_convert_success(converter, mock_word_app, tmp_path):
     settings = PDFConversionSettings()
     result = converter.convert(input_file, output_file, settings)
     
-    # Verify Open called
-    mock_word_app.Documents.Open.assert_called_once_with(
-        str(input_file.resolve()), ReadOnly=True, Visible=False
-    )
+    # Verify Open called with correct file path (other params suppress dialogs)
+    mock_word_app.Documents.Open.assert_called_once()
+    call_args = mock_word_app.Documents.Open.call_args
+    assert call_args[0][0] == str(input_file.resolve())
+    # Verify key dialog suppression parameters
+    assert call_args[1].get('ConfirmConversions') == False
+    assert call_args[1].get('ReadOnly') == True
     
     # Verify Export called
     assert mock_doc.ExportAsFixedFormat.call_count == 1

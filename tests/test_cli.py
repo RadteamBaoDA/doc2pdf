@@ -3,7 +3,7 @@ from typer.testing import CliRunner
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 from src.cli import app, get_file_type
-from src import __version__
+from src.version import __version__
 
 runner = CliRunner()
 
@@ -11,6 +11,16 @@ runner = CliRunner()
 @pytest.fixture(autouse=True)
 def mock_console_clear():
     with patch("src.cli.console.clear"):
+        yield
+
+@pytest.fixture(autouse=True)
+def mock_atexit():
+    with patch("src.cli.atexit.register"):
+        yield
+
+@pytest.fixture(autouse=True)
+def mock_process_registry():
+    with patch("src.cli.ProcessRegistry.kill_all"):
         yield
 
 def test_version():

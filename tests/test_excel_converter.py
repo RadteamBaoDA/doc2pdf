@@ -20,11 +20,18 @@ def mock_pythoncom():
 
 
 @pytest.fixture
+def mock_process_registry():
+    with patch("src.core.excel_converter.ProcessRegistry"):
+        yield
+
+
+@pytest.fixture
 def mock_sheet_settings():
     """Mock get_excel_sheet_settings to return the base settings unchanged."""
     with patch("src.core.excel_converter.get_excel_sheet_settings") as mock_get:
         # Return the base_settings passed to it (second argument)
-        def side_effect(sheet_name, base_settings, input_path=None):
+        # Updated signature: (sheet_name, base_settings, input_path, base_path)
+        def side_effect(sheet_name, base_settings, input_path=None, base_path=None):
             if not getattr(base_settings, 'excel', None):
                 base_settings.excel = ExcelSettings()
             return base_settings
@@ -33,7 +40,7 @@ def mock_sheet_settings():
 
 
 @pytest.fixture
-def converter(mock_excel_app, mock_pythoncom, mock_sheet_settings):
+def converter(mock_excel_app, mock_pythoncom, mock_sheet_settings, mock_process_registry):
     return ExcelConverter()
 
 
@@ -90,7 +97,11 @@ def test_convert_success(converter, mock_excel_app, tmp_path):
     mock_sheet = MagicMock()
     configure_mock_sheet(mock_sheet, name="Sheet1", cols=10, rows=100)
     
-    mock_workbook.Worksheets = [mock_sheet]
+    # Mock Worksheets as a list with __iter__ and __call__ for item access
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
@@ -115,7 +126,13 @@ def test_convert_with_sheet_name(converter, mock_excel_app, tmp_path):
     mock_sheet2 = MagicMock()
     configure_mock_sheet(mock_sheet2, name="Summary", cols=3, rows=5)
     
-    mock_workbook.Worksheets = [mock_sheet1, mock_sheet2]
+    # Mock Worksheets as a list with __iter__ and __call__ for item access
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet1, mock_sheet2])
+    def get_sheet(idx):
+        return mock_sheet1 if idx == 1 else mock_sheet2
+    mock_worksheets.__call__ = get_sheet
+    mock_workbook.Worksheets = mock_worksheets
     mock_workbook.ActiveSheet = mock_sheet1
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
@@ -136,7 +153,10 @@ def test_convert_row_dimensions_fit_all(converter, mock_excel_app, tmp_path):
     mock_sheet = MagicMock()
     configure_mock_sheet(mock_sheet, name="Sheet1", cols=20, rows=500)
     
-    mock_workbook.Worksheets = [mock_sheet]
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
@@ -157,7 +177,10 @@ def test_convert_orientation_portrait(converter, mock_excel_app, tmp_path):
     mock_sheet = MagicMock()
     configure_mock_sheet(mock_sheet, name="Sheet1", cols=5, rows=10)
     
-    mock_workbook.Worksheets = [mock_sheet]
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
@@ -179,7 +202,10 @@ def test_convert_metadata_header_enabled(converter, mock_excel_app, tmp_path):
     mock_sheet = MagicMock()
     configure_mock_sheet(mock_sheet, name="DataSheet", cols=10, rows=20)
     
-    mock_workbook.Worksheets = [mock_sheet]
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
@@ -204,7 +230,10 @@ def test_convert_low_quality(converter, mock_excel_app, tmp_path):
     mock_sheet = MagicMock()
     configure_mock_sheet(mock_sheet, name="Sheet1", cols=5, rows=10)
     
-    mock_workbook.Worksheets = [mock_sheet]
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     

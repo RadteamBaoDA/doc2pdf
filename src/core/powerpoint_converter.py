@@ -2,6 +2,7 @@
 PowerPoint to PDF Converter using pywin32 COM.
 """
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 import win32com.client
@@ -31,6 +32,15 @@ ppPrintPureBlackAndWhite = 3
 # Save/Close constants
 ppSaveChanges = 1
 ppDoNotSaveChanges = 2
+
+# AutomationSecurity constants (msoAutomationSecurity)
+msoAutomationSecurityForceDisable = 3
+msoAutomationSecurityByUI = 2
+msoAutomationSecurityLow = 1
+
+# Alert Level constants
+ppAlertsNone = 2
+ppAlertsAll = 1
 
 
 class PowerPointConverter(Converter):
@@ -80,19 +90,26 @@ class PowerPointConverter(Converter):
             with self._powerpoint_application() as ppt:
                 presentation = None
                 try:
-                    # Open Presentation (ReadOnly for safety)
+                    # Open Presentation with all parameters to suppress dialogs
+                    # FileName: Path to file
+                    # ReadOnly=True: Open read-only for safety
+                    # Untitled=False: Use original title
+                    # WithWindow=False: Don't show window (msoFalse)
+                    # OpenConflictDocument=False: Don't prompt about conflicts
                     presentation = ppt.Presentations.Open(
                         str(input_file), 
                         ReadOnly=True, 
                         Untitled=False, 
-                        WithWindow=False
+                        WithWindow=False,
+                        OpenConflictDocument=False
                     )
                     
                     # Prepare Export Arguments
                     export_args = self._map_settings(settings, str(out_file))
                     
-                    # Export to PDF
-                    presentation.ExportAsFixedFormat(**export_args)
+                    # Export to PDF with timeout protection
+                    logger.info(f"Exporting '{input_file.name}' to PDF format...")
+                    self._safe_com_call(lambda: presentation.ExportAsFixedFormat(**export_args), timeout=120)
                     
                     logger.success(f"Successfully converted: {out_file}")
                     
@@ -101,7 +118,7 @@ class PowerPointConverter(Converter):
                     raise
                 finally:
                     if presentation:
-                        presentation.Close()
+                        self._safe_com_call(lambda: presentation.Close(), timeout=10)
         finally:
             pythoncom.CoUninitialize()
             
@@ -115,9 +132,13 @@ class PowerPointConverter(Converter):
         ppt = None
         try:
             ppt = win32com.client.Dispatch("PowerPoint.Application")
-            # Note: PowerPoint doesn't have a Visible property like Word
-            # but setting DisplayAlerts to false can help
-            ppt.DisplayAlerts = False
+            # Suppress ALL alerts and dialogs
+            # ppAlertsNone = 2 suppresses all alerts
+            ppt.DisplayAlerts = ppAlertsNone
+            # Disable macro/automation security prompts
+            ppt.AutomationSecurity = msoAutomationSecurityForceDisable
+            # Disable events that might trigger dialogs
+            ppt.EnableEvents = False
             ProcessRegistry.register(ppt)
             yield ppt
         except Exception as e:
@@ -126,7 +147,55 @@ class PowerPointConverter(Converter):
         finally:
             if ppt:
                 ProcessRegistry.unregister(ppt)
-                ppt.Quit()
+                self._safe_quit(ppt)
+
+    def _safe_quit(self, app, timeout_seconds: int = 5) -> None:
+        """Safely quit application with timeout protection."""
+        result = [False]
+        
+        def quit_app():
+            try:
+                app.DisplayAlerts = ppAlertsNone
+            except:
+                pass
+            try:
+                app.Quit()
+                result[0] = True
+            except Exception as e:
+                logger.debug(f"App.Quit() raised: {e}")
+        
+        thread = threading.Thread(target=quit_app)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout_seconds)
+        
+        if not result[0]:
+            logger.warning(f"PowerPoint.Quit() timed out or failed after {timeout_seconds}s")
+
+    def _safe_com_call(self, func, timeout: int = 60, default=None):
+        """Execute a COM call with timeout protection."""
+        result = [default]
+        error = [None]
+        
+        def execute():
+            try:
+                result[0] = func()
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=execute)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            logger.warning(f"COM operation timed out after {timeout}s")
+            return default
+        
+        if error[0]:
+            raise error[0]
+            
+        return result[0]
 
     def _map_settings(self, settings: PDFConversionSettings, output_path: str) -> dict:
         """

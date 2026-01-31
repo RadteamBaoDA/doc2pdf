@@ -49,6 +49,16 @@ xlPrintNoComments = -4142
 # Worksheet visibility
 xlSheetVisible = -1
 
+# AutomationSecurity constants (msoAutomationSecurity)
+msoAutomationSecurityForceDisable = 3
+msoAutomationSecurityByUI = 2
+msoAutomationSecurityLow = 1
+
+# CorruptLoad constants - for opening potentially corrupted files
+xlNormalLoad = 0
+xlRepairFile = 1
+xlExtractData = 2
+
 
 class OversizedSheetError(Exception):
     """Raised when a sheet is too large to print at acceptable quality."""
@@ -122,12 +132,37 @@ class ExcelConverter(Converter):
                 final_sheets_to_process = []
                 
                 try:
-                    # Open Workbook (ReadOnly for safety)
+                    # Open Workbook with all parameters to suppress dialogs
+                    # UpdateLinks=0: Don't update/prompt about external links
+                    # ReadOnly=True: Open read-only for safety
+                    # Format=None: Auto-detect delimiter format
+                    # Password="": No password prompt
+                    # WriteResPassword="": No write-reservation password prompt
+                    # IgnoreReadOnlyRecommended=True: Ignore read-only recommendation
+                    # Origin=None: Auto-detect origin
+                    # Delimiter=None: Auto-detect delimiter
+                    # Editable=False: Don't allow editing (no edit prompt)
+                    # Notify=False: Don't notify about file reservation
+                    # Converter=None: Auto-select converter
+                    # AddToMru=False: Don't add to recent files
+                    # Local=True: Use local settings without prompts
+                    # CorruptLoad=xlNormalLoad: Normal load without repair dialog
                     workbook = excel.Workbooks.Open(
                         str(input_file), 
+                        UpdateLinks=0,
                         ReadOnly=True,
-                        UpdateLinks=False,
-                        IgnoreReadOnlyRecommended=True
+                        Format=None,
+                        Password="",
+                        WriteResPassword="",
+                        IgnoreReadOnlyRecommended=True,
+                        Origin=None,
+                        Delimiter=None,
+                        Editable=False,
+                        Notify=False,
+                        Converter=None,
+                        AddToMru=False,
+                        Local=True,
+                        CorruptLoad=xlNormalLoad
                     )
                     
                     # Get sheets to process
@@ -187,16 +222,16 @@ class ExcelConverter(Converter):
                                     start_row = i * row_lim + 1
                                     end_row = min((i + 1) * row_lim, last_row)
                                     
-                                    # Copy sheet to end
+                                    # Copy sheet to end with timeout protection
                                     last_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                    sheet.Copy(None, last_sheet)
+                                    self._safe_com_call(lambda s=sheet, ls=last_sheet: s.Copy(None, ls), timeout=30)
                                     new_sheet = workbook.Sheets(workbook.Sheets.Count)
                                     
                                     temp_sheets_to_delete.append(new_sheet)
                                     
                                     # Set Print Area explicitly to True content columns
                                     # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
-                                    new_sheet.PageSetup.PrintArea = f"$A${start_row}:${last_col_alpha}${end_row}"
+                                    self._safe_set_page_property(new_sheet.PageSetup, 'PrintArea', f"$A${start_row}:${last_col_alpha}${end_row}")
                                     
                                     # Create chunk settings
                                     chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
@@ -229,7 +264,7 @@ class ExcelConverter(Converter):
                                     continue
                                     
                                 # Set print area to avoid printing 1000 blank pages of formatting
-                                sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
+                                self._safe_set_page_property(sheet.PageSetup, 'PrintArea', f"$A$1:${last_col_alpha}${last_row}")
                                 
                                 self._apply_page_setup(
                                     sheet, 
@@ -269,17 +304,20 @@ class ExcelConverter(Converter):
                     logger.error(f"Failed to convert {input_file.name}: {e}")
                     raise
                 finally:
-                    # Cleanup temps
+                    # Cleanup temps with timeout protection
                     if temp_sheets_to_delete:
-                        excel.DisplayAlerts = False
+                        try:
+                            excel.DisplayAlerts = False
+                        except:
+                            pass
                         for t in temp_sheets_to_delete:
                             try:
-                                t.Delete()
+                                self._safe_com_call(lambda: t.Delete(), timeout=3)
                             except:
                                 pass
                     
                     if workbook:
-                        workbook.Close(SaveChanges=False)
+                        self._safe_com_call(lambda: workbook.Close(SaveChanges=False), timeout=5)
         finally:
             pythoncom.CoUninitialize()
             
@@ -292,8 +330,19 @@ class ExcelConverter(Converter):
         try:
             excel = win32com.client.Dispatch("Excel.Application")
             excel.Visible = False
+            # Suppress ALL alerts and dialogs
             excel.DisplayAlerts = False
             excel.ScreenUpdating = False
+            # Disable macro/automation security prompts
+            excel.AutomationSecurity = msoAutomationSecurityForceDisable
+            # Disable interactive mode - no user prompts
+            excel.Interactive = False
+            # Disable events that might trigger dialogs
+            excel.EnableEvents = False
+            # Don't prompt about links
+            excel.AskToUpdateLinks = False
+            # Suppress clipboard prompts
+            excel.CutCopyMode = False
             
             # Try to set optimal printer
             self._set_optimal_printer(excel)
@@ -306,7 +355,44 @@ class ExcelConverter(Converter):
         finally:
             if excel:
                 ProcessRegistry.unregister(excel)
+                self._safe_quit_excel(excel)
+
+    def _safe_quit_excel(self, excel, timeout_seconds: int = 5) -> None:
+        """
+        Safely quit Excel application with timeout protection.
+        
+        Excel.Quit() can hang if Excel is stuck in a modal dialog or
+        waiting for printer driver response. This method uses a timeout
+        to prevent indefinite blocking.
+        
+        Args:
+            excel: Excel Application COM object
+            timeout_seconds: Maximum time to wait for Quit() to complete
+        """
+        import threading
+        
+        def quit_excel():
+            try:
+                # Ensure DisplayAlerts is off before quitting
+                try:
+                    excel.DisplayAlerts = False
+                except:
+                    pass
                 excel.Quit()
+            except Exception as e:
+                logger.debug(f"Excel.Quit() raised: {e}")
+        
+        thread = threading.Thread(target=quit_excel)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout_seconds)
+        
+        if thread.is_alive():
+            logger.warning(f"Excel.Quit() timed out after {timeout_seconds}s - Excel process may need manual termination")
+            # Don't raise - let the process continue, the OS will clean up eventually
+            # or the user can kill it manually
+        else:
+            logger.debug("Excel application closed successfully")
 
     def _set_optimal_printer(self, excel) -> None:
         """
@@ -444,6 +530,138 @@ class ExcelConverter(Converter):
             logger.warning(f"Could not calculate smart page size: {e}")
             return self.MIN_PAGE_WIDTH_INCHES, self.DEFAULT_PAGE_HEIGHT_INCHES
 
+    def _try_set_paper_size(self, page_setup, paper_enum: int, paper_name: str, timeout_seconds: int = 3) -> bool:
+        """
+        Safely attempt to set paper size with timeout protection.
+        
+        Some printer drivers can block indefinitely when setting unsupported paper sizes.
+        This method wraps the operation with a timeout to prevent freezing.
+        
+        Args:
+            page_setup: Excel PageSetup object
+            paper_enum: Excel paper size constant (e.g., xlPaperA3)
+            paper_name: Human-readable paper name for logging
+            timeout_seconds: Maximum time to wait for the operation
+            
+        Returns:
+            True if paper size was set successfully, False otherwise
+        """
+        import threading
+        
+        result = [False]
+        error = [None]
+        
+        def set_paper():
+            try:
+                page_setup.PaperSize = paper_enum
+                # Verify it was actually set
+                if page_setup.PaperSize == paper_enum:
+                    result[0] = True
+                else:
+                    logger.debug(f"Printer rejected paper size {paper_name} (Enum {paper_enum}). Trying next size...")
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=set_paper)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout_seconds)
+        
+        if thread.is_alive():
+            logger.warning(f"Paper size '{paper_name}' setting timed out after {timeout_seconds}s - printer driver may be unresponsive")
+            return False
+        
+        if error[0]:
+            logger.debug(f"Failed to set paper size to {paper_name}: {error[0]}")
+            return False
+            
+        return result[0]
+
+    def _safe_com_call(self, func, timeout: int = 10, default=None):
+        """
+        Execute a COM call with timeout protection.
+        
+        This is a general-purpose wrapper for any COM operation that might hang.
+        Used for operations like workbook.Close(), sheet.Copy(), ExportAsFixedFormat(), etc.
+        
+        Args:
+            func: Lambda or callable to execute
+            timeout: Maximum time to wait in seconds
+            default: Value to return if timeout or error occurs
+            
+        Returns:
+            Result of func() or default if timed out/failed
+        """
+        import threading
+        
+        result = [default]
+        error = [None]
+        
+        def execute():
+            try:
+                result[0] = func()
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=execute)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            logger.warning(f"COM operation timed out after {timeout}s")
+            return default
+        
+        if error[0]:
+            logger.debug(f"COM operation failed: {error[0]}")
+            raise error[0]
+            
+        return result[0]
+
+    def _safe_set_page_property(self, page_setup, prop_name: str, value, timeout_seconds: int = 3) -> bool:
+        """
+        Safely set a PageSetup property with timeout protection.
+        
+        PageSetup property assignments can block indefinitely when the printer
+        driver is unresponsive or Excel is in a modal state. This method wraps
+        the operation with a timeout to prevent freezing.
+        
+        Args:
+            page_setup: Excel PageSetup object
+            prop_name: Name of the property to set (e.g., 'Orientation', 'Zoom')
+            value: Value to assign to the property
+            timeout_seconds: Maximum time to wait for the operation
+            
+        Returns:
+            True if property was set successfully, False if timed out or failed
+        """
+        import threading
+        
+        result = [False]
+        error = [None]
+        
+        def set_property():
+            try:
+                setattr(page_setup, prop_name, value)
+                result[0] = True
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=set_property)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout_seconds)
+        
+        if thread.is_alive():
+            logger.warning(f"PageSetup.{prop_name} setting timed out after {timeout_seconds}s - printer driver may be unresponsive")
+            return False
+        
+        if error[0]:
+            logger.debug(f"Failed to set PageSetup.{prop_name}: {error[0]}")
+            return False
+            
+        return result[0]
+
     def _apply_page_setup(
         self, 
         sheet, 
@@ -472,7 +690,7 @@ class ExcelConverter(Converter):
                 content_width_points=content_width_points
             )
             
-            # Set orientation
+            # Set orientation with timeout protection
             # If width > 8.5 OR explicitly set to landscape, try landscape.
             # But normally we auto-detect orientation based on width ratio?
             # For now, stick to settings or default to portrait if narrow, landscape if wide?
@@ -482,18 +700,30 @@ class ExcelConverter(Converter):
             # If content is wider than 8.5 but less than 11, Landscape Letter is better than Portrait Letter?
             # Let's trust the settings or default to Portrait unless it's very wide.
             
+            # Determine target orientation
+            target_orientation = xlPortrait  # Default
             if excel_settings.orientation.lower() == "landscape":
-                page_setup.Orientation = xlLandscape
+                target_orientation = xlLandscape
             elif excel_settings.orientation.lower() == "portrait":
-                page_setup.Orientation = xlPortrait
+                target_orientation = xlPortrait
             else:
-                 # Auto orientation
-                 if page_width > 8.5:
-                     page_setup.Orientation = xlLandscape
-                 else:
-                     page_setup.Orientation = xlPortrait
+                # Auto orientation based on content width
+                if page_width > 8.5:
+                    target_orientation = xlLandscape
+                else:
+                    target_orientation = xlPortrait
+            
+            # Apply orientation with timeout protection
+            orientation_set = self._safe_set_page_property(page_setup, 'Orientation', target_orientation)
+            if not orientation_set:
+                logger.warning(f"Could not set orientation for sheet '{sheet.Name}', using default")
 
-            is_landscape = (page_setup.Orientation == xlLandscape)
+            # Read back orientation (may differ from target if setting failed)
+            try:
+                is_landscape = (page_setup.Orientation == xlLandscape)
+            except:
+                # Fallback: assume target was applied
+                is_landscape = (target_orientation == xlLandscape)
             
             # Define ladder of supported sizes
             # Format: (Enum, WidthLimit (inches), Name)
@@ -549,40 +779,31 @@ class ExcelConverter(Converter):
                 candidates = [paper_ladder[-1]]
                 oversized = True
             
-            # 2. Try to set valid paper size
+            # 2. Try to set valid paper size with timeout protection
+            PAPER_SIZE_TIMEOUT = 3  # seconds per paper size attempt
             for (enum_to_try, limit_to_try, name_to_try) in candidates:
-                try:
-                    page_setup.PaperSize = enum_to_try
-                    # Verify
-                    if page_setup.PaperSize == enum_to_try:
-                        selected_paper = enum_to_try
-                        selected_name = name_to_try
-                        limit_width = limit_to_try
-                        logger.info(f"Sheet '{sheet.Name}': Selected paper size '{selected_name}' (Limit {limit_width:.2f}\") to fit estimated content width: {page_width:.2f}\"")
-                        paper_set_success = True
-                        break
-                    else:
-                        logger.debug(f"Printer rejected paper size {name_to_try} (Enum {enum_to_try}). Trying next larger size...")
-                except Exception as e:
-                    logger.debug(f"Failed to set paper size to {name_to_try}: {e}")
-                    continue
+                success = self._try_set_paper_size(page_setup, enum_to_try, name_to_try, PAPER_SIZE_TIMEOUT)
+                if success:
+                    selected_paper = enum_to_try
+                    selected_name = name_to_try
+                    limit_width = limit_to_try
+                    logger.info(f"Sheet '{sheet.Name}': Selected paper size '{selected_name}' (Limit {limit_width:.2f}\") to fit estimated content width: {page_width:.2f}\"")
+                    paper_set_success = True
+                    break
             
             if not paper_set_success:
                 logger.warning(f"Could not set any appropriate paper size for width {page_width:.2f}\". Printer may lack support for large sizes.")
                 # Fallback: Try all paper sizes from largest to smallest to find the biggest the printer supports
                 fallback_sizes = list(reversed(paper_ladder))  # Try from largest to smallest
                 for (fb_enum, fb_width, fb_name) in fallback_sizes:
-                    try:
-                        page_setup.PaperSize = fb_enum
-                        if page_setup.PaperSize == fb_enum:
-                            selected_paper = fb_enum
-                            selected_name = fb_name
-                            limit_width = fb_width
-                            paper_set_success = True
-                            logger.info(f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - largest size supported by printer. Content will be scaled to fit.")
-                            break
-                    except Exception:
-                        continue
+                    success = self._try_set_paper_size(page_setup, fb_enum, fb_name, PAPER_SIZE_TIMEOUT)
+                    if success:
+                        selected_paper = fb_enum
+                        selected_name = fb_name
+                        limit_width = fb_width
+                        paper_set_success = True
+                        logger.info(f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - largest size supported by printer. Content will be scaled to fit.")
+                        break
                 
                 if not paper_set_success:
                     logger.warning("Could not set any paper size. Using printer default.")
@@ -635,19 +856,20 @@ class ExcelConverter(Converter):
                          logger.error(err_msg)
                          raise ValueError(err_msg)
 
-            # 4. Final Setup
-            page_setup.Zoom = False
-            page_setup.FitToPagesWide = 1
-            page_setup.BlackAndWhite = False  # Ensure color rendering for charts/text labels
+            # 4. Final Setup - Apply remaining page setup properties with timeout protection
+            # These can also hang on unresponsive printer drivers
+            self._safe_set_page_property(page_setup, 'Zoom', False)
+            self._safe_set_page_property(page_setup, 'FitToPagesWide', 1)
+            self._safe_set_page_property(page_setup, 'BlackAndWhite', False)  # Ensure color rendering for charts/text labels
             self._apply_row_dimensions(sheet, page_setup, excel_settings)
             
-            # Margins
+            # Margins - apply with timeout protection
             margin_points = 36 # 0.5 inch
             top_margin = 72 if excel_settings.metadata_header else 36
-            page_setup.LeftMargin = margin_points
-            page_setup.RightMargin = margin_points
-            page_setup.TopMargin = top_margin
-            page_setup.BottomMargin = margin_points
+            self._safe_set_page_property(page_setup, 'LeftMargin', margin_points)
+            self._safe_set_page_property(page_setup, 'RightMargin', margin_points)
+            self._safe_set_page_property(page_setup, 'TopMargin', top_margin)
+            self._safe_set_page_property(page_setup, 'BottomMargin', margin_points)
             
         except ValueError:
             raise
@@ -655,18 +877,21 @@ class ExcelConverter(Converter):
             logger.warning(f"Could not apply some page setup settings for '{sheet.Name}': {e}")
 
     def _apply_row_dimensions(self, sheet, page_setup, excel_settings: ExcelSettings) -> None:
-        """Apply vertical pagination based on row_dimensions."""
-        if excel_settings.row_dimensions == 0:
-            # Fit entire sheet on one page
-            page_setup.FitToPagesTall = 1
-        elif excel_settings.row_dimensions:
-            # Multiple pages based on row count
-            used_rows = sheet.UsedRange.Rows.Count
-            pages_tall = max(1, (used_rows + excel_settings.row_dimensions - 1) // excel_settings.row_dimensions)
-            page_setup.FitToPagesTall = pages_tall
-        else:
-            # Auto - let Excel decide
-            page_setup.FitToPagesTall = False
+        """Apply vertical pagination based on row_dimensions with timeout protection."""
+        try:
+            if excel_settings.row_dimensions == 0:
+                # Fit entire sheet on one page
+                self._safe_set_page_property(page_setup, 'FitToPagesTall', 1)
+            elif excel_settings.row_dimensions:
+                # Multiple pages based on row count
+                used_rows = sheet.UsedRange.Rows.Count
+                pages_tall = max(1, (used_rows + excel_settings.row_dimensions - 1) // excel_settings.row_dimensions)
+                self._safe_set_page_property(page_setup, 'FitToPagesTall', pages_tall)
+            else:
+                # Auto - let Excel decide
+                self._safe_set_page_property(page_setup, 'FitToPagesTall', False)
+        except Exception as e:
+            logger.debug(f"Could not apply row dimensions: {e}")
 
     def _apply_metadata_header(
         self, 
@@ -682,20 +907,20 @@ class ExcelConverter(Converter):
         try:
             page_setup = sheet.PageSetup
             
-            # Left header: Sheet name (or custom)
-            page_setup.LeftHeader = left_text if left_text else "&A"
+            # Left header: Sheet name (or custom) - with timeout protection
+            self._safe_set_page_property(page_setup, 'LeftHeader', left_text if left_text else "&A")
             
             # Center header: Custom text (Row range) or empty
-            page_setup.CenterHeader = center_text
+            self._safe_set_page_property(page_setup, 'CenterHeader', center_text)
             
             # Right header: Filename + Page Number
             # Format: filename (Page X)
-            page_setup.RightHeader = f"{filename} (Page &P)"
+            self._safe_set_page_property(page_setup, 'RightHeader', f"{filename} (Page &P)")
             
             # Clear footers to avoid clutter and potential crop issues
-            page_setup.RightFooter = ""
-            page_setup.CenterFooter = ""
-            page_setup.LeftFooter = ""
+            self._safe_set_page_property(page_setup, 'RightFooter', "")
+            self._safe_set_page_property(page_setup, 'CenterFooter', "")
+            self._safe_set_page_property(page_setup, 'LeftFooter', "")
             
             logger.debug(f"Applied metadata header for sheet '{sheet.Name}' (Center: '{center_text}')")
             
@@ -793,6 +1018,117 @@ class ExcelConverter(Converter):
             string = chr(65 + remainder) + string
         return string
 
+    def _expand_bounds_for_shapes(
+        self, 
+        sheet, 
+        max_width: float, 
+        max_height: float, 
+        last_row: int, 
+        last_col: int,
+        points_per_inch: float
+    ) -> Tuple[float, float, int, int]:
+        """
+        Safely iterate through shapes to expand content bounds.
+        
+        Uses per-shape timeout to prevent COM blocking from problematic shapes
+        (OLE objects, external links, etc.) from freezing the application.
+        
+        Args:
+            sheet: Excel Worksheet object
+            max_width: Current max width in points
+            max_height: Current max height in points  
+            last_row: Current last row index
+            last_col: Current last column index
+            points_per_inch: Conversion factor
+            
+        Returns:
+            Tuple of (max_width, max_height, last_row, last_col)
+        """
+        SHAPE_ACCESS_TIMEOUT = 2  # seconds per shape property access
+        MAX_SHAPE_ERRORS = 5  # Stop after this many consecutive errors
+        
+        try:
+            # First, try to get shapes count with timeout
+            shapes_count = 0
+            try:
+                shapes_count = sheet.Shapes.Count
+            except Exception as e:
+                logger.debug(f"Could not access Shapes collection: {e}")
+                return max_width, max_height, last_row, last_col
+            
+            if shapes_count == 0:
+                return max_width, max_height, last_row, last_col
+                
+            logger.debug(f"Processing {shapes_count} shapes for bounds calculation...")
+            consecutive_errors = 0
+            
+            for i in range(1, shapes_count + 1):  # Excel shapes are 1-indexed
+                try:
+                    shape = sheet.Shapes(i)
+                    
+                    # Access shape properties with individual try-except
+                    # This prevents one bad shape from blocking the entire loop
+                    shape_name = "Unknown"
+                    try:
+                        shape_name = shape.Name
+                    except:
+                        pass
+                    
+                    # Get position/size properties - these can block on OLE objects
+                    shape_left = 0
+                    shape_top = 0
+                    shape_width = 0
+                    shape_height = 0
+                    
+                    try:
+                        shape_left = shape.Left
+                        shape_top = shape.Top
+                        shape_width = shape.Width
+                        shape_height = shape.Height
+                    except Exception as prop_err:
+                        logger.debug(f"Shape {i} '{shape_name}' property access failed: {prop_err}")
+                        consecutive_errors += 1
+                        if consecutive_errors >= MAX_SHAPE_ERRORS:
+                            logger.warning(f"Too many shape access errors ({MAX_SHAPE_ERRORS}), skipping remaining shapes")
+                            break
+                        continue
+                    
+                    # Reset error counter on success
+                    consecutive_errors = 0
+                    
+                    shape_right = shape_left + shape_width
+                    shape_bottom = shape_top + shape_height
+                    
+                    if shape_right > max_width:
+                        logger.debug(f"Shape '{shape_name}' extends width to {shape_right:.1f}pt ({shape_right/points_per_inch:.2f}in)")
+                        max_width = shape_right
+                    if shape_bottom > max_height:
+                        max_height = shape_bottom
+                    
+                    # Try to get cell bounds (optional, non-critical)
+                    try:
+                        br_cell = shape.BottomRightCell
+                        if br_cell:
+                            if br_cell.Row > last_row:
+                                last_row = br_cell.Row
+                            if br_cell.Column > last_col:
+                                last_col = br_cell.Column
+                    except Exception:
+                        pass
+                        
+                except Exception as shape_err:
+                    logger.debug(f"Error processing shape {i}: {shape_err}")
+                    consecutive_errors += 1
+                    if consecutive_errors >= MAX_SHAPE_ERRORS:
+                        logger.warning(f"Too many shape access errors ({MAX_SHAPE_ERRORS}), skipping remaining shapes")
+                        break
+                    continue
+                    
+        except Exception as e:
+            logger.warning(f"Shape bounds expansion failed: {e}")
+            
+        return max_width, max_height, last_row, last_col
+
     def _export_to_pdf(
         self, 
         workbook, 
@@ -809,6 +1145,10 @@ class ExcelConverter(Converter):
             output_path: Path for output PDF
             settings: PDF conversion settings
         """
+        # Timeout for export operations - longer for large documents
+        EXPORT_TIMEOUT = 120  # 2 minutes per export operation
+        COPY_TIMEOUT = 30  # 30 seconds per sheet copy
+        
         try:
             # Determine quality
             quality = xlQualityStandard
@@ -817,20 +1157,26 @@ class ExcelConverter(Converter):
 
             if len(sheets) == 1:
                 # Export single sheet directly
-                sheets[0].ExportAsFixedFormat(
-                    Type=xlTypePDF,
-                    Filename=output_path,
-                    Quality=quality,
-                    IncludeDocProperties=settings.metadata.include_properties,
-                    IgnorePrintAreas=False,
-                    OpenAfterPublish=False
-                )
+                logger.info(f"Exporting sheet '{sheets[0].Name}' to PDF...")
+                
+                def do_single_export():
+                    sheets[0].ExportAsFixedFormat(
+                        Type=xlTypePDF,
+                        Filename=output_path,
+                        Quality=quality,
+                        IncludeDocProperties=settings.metadata.include_properties,
+                        IgnorePrintAreas=False,
+                        OpenAfterPublish=False
+                    )
+                
+                self._safe_com_call(do_single_export, timeout=EXPORT_TIMEOUT)
+                logger.debug(f"Sheet '{sheets[0].Name}' exported successfully")
             else:
                 # Multiple sheets: Copy to new temporary workbook iteratively
                 logger.debug(f"Preparing to copy {len(sheets)} sheets to new workbook.")
                 
-                # Copy first sheet -> Creates new Workbook
-                sheets[0].Copy()
+                # Copy first sheet -> Creates new Workbook (with timeout)
+                self._safe_com_call(lambda: sheets[0].Copy(), timeout=COPY_TIMEOUT)
                 temp_wb = workbook.Application.ActiveWorkbook
                 
                 logger.debug(f"Created temp WB. Sheets count: {temp_wb.Sheets.Count}")
@@ -841,7 +1187,7 @@ class ExcelConverter(Converter):
                         last_sheet = temp_wb.Sheets(temp_wb.Sheets.Count)
                         # Use positional arguments for Copy: Copy(Before, After)
                         # s.Copy(None, last_sheet) -> Copy After last_sheet
-                        s.Copy(None, last_sheet)
+                        self._safe_com_call(lambda sh=s, ls=last_sheet: sh.Copy(None, ls), timeout=COPY_TIMEOUT)
                         logger.debug(f"Copied sheet {idx}/{len(sheets)}. New count: {temp_wb.Sheets.Count}")
                     except Exception as copy_err:
                         logger.error(f"Failed to copy sheet {idx}: {copy_err}")
@@ -858,17 +1204,23 @@ class ExcelConverter(Converter):
                             
                     sel_count = temp_wb.Windows(1).SelectedSheets.Count
                     logger.debug(f"Selected {sel_count} sheets for export.")
-                            
-                    temp_wb.ExportAsFixedFormat(
-                        Type=xlTypePDF,
-                        Filename=output_path,
-                        Quality=quality,
-                        IncludeDocProperties=settings.metadata.include_properties,
-                        IgnorePrintAreas=False,
-                        OpenAfterPublish=False
-                    )
+                    
+                    logger.info(f"Exporting {sel_count} sheets to PDF...")
+                    
+                    def do_multi_export():
+                        temp_wb.ExportAsFixedFormat(
+                            Type=xlTypePDF,
+                            Filename=output_path,
+                            Quality=quality,
+                            IncludeDocProperties=settings.metadata.include_properties,
+                            IgnorePrintAreas=False,
+                            OpenAfterPublish=False
+                        )
+                    
+                    self._safe_com_call(do_multi_export, timeout=EXPORT_TIMEOUT)
+                    logger.debug(f"Multi-sheet export completed successfully")
                 finally:
-                    temp_wb.Close(SaveChanges=False)
+                    self._safe_com_call(lambda: temp_wb.Close(SaveChanges=False), timeout=10)
 
             
         except Exception as e:
@@ -1030,6 +1382,15 @@ class ExcelConverter(Converter):
                         text_len = len(text)
                         
                         if text_len > 15:
+                            # Check if this cell has wrap text enabled - if so, skip overflow detection
+                            try:
+                                cell = sheet.Cells(row_idx, col_idx)
+                                if cell.WrapText:
+                                    # Text wraps within the column, no horizontal overflow
+                                    continue
+                            except Exception:
+                                pass
+                            
                             estimated_width = text_len * AVG_CHAR_WIDTH_POINTS
                             
                             # Check if this cell is merged and calculate merged width
@@ -1075,7 +1436,13 @@ class ExcelConverter(Converter):
                     continue
             
             if max_text_len > 0:
-                logger.debug(f"Sheet '{sheet.Name}' text overflow detected: {max_text_len} chars extending to col {max_text_extended_col}")
+                # Log column widths for debugging
+                col_width_summary = ", ".join([f"Col{i+1}:{col_widths[i]:.1f}pt" for i in range(min(search_last_col, len(col_widths)))])
+                total_width_pts = sum(col_widths[:search_last_col])
+                logger.debug(
+                    f"Sheet '{sheet.Name}' text overflow detected: {max_text_len} chars extending to col {max_text_extended_col}. "
+                    f"Column widths (1-{search_last_col}): [{col_width_summary}], Total: {total_width_pts:.1f}pt ({total_width_pts/72:.2f}in)"
+                )
                         
         except Exception as e:
             logger.debug(f"Text overflow detection sampling failed: {e}")
@@ -1154,11 +1521,16 @@ class ExcelConverter(Converter):
                     bounds_source = "PageBreaks"
                 
                 # Priority 3b: Detect longest text and extend bounds if needed
-                text_col, text_len, overflow_extra_width = self._find_longest_text_column(sheet, last_row, last_col)
-                if text_col > last_col:
-                    logger.info(f"Sheet '{sheet.Name}' extending column bound from {last_col} to {text_col} for text overflow")
-                    last_col = text_col
-                    bounds_source = "TextOverflow"
+                # Skip text overflow detection if VPageBreak defines column boundary
+                overflow_extra_width = 0.0
+                if break_col > 0:
+                    logger.debug(f"Sheet '{sheet.Name}' skipping text overflow detection - VPageBreak defines column boundary at {break_col}")
+                else:
+                    text_col, text_len, overflow_extra_width = self._find_longest_text_column(sheet, last_row, last_col)
+                    if text_col > last_col:
+                        logger.info(f"Sheet '{sheet.Name}' extending column bound from {last_col} to {text_col} for text overflow")
+                        last_col = text_col
+                        bounds_source = "TextOverflow"
             
             logger.debug(f"Sheet '{sheet.Name}' bounds source: {bounds_source}")
             
@@ -1196,30 +1568,10 @@ class ExcelConverter(Converter):
                 f"Rows=1-{last_row}, Total Height={total_height_points:.1f}pt ({total_height_points/POINTS_PER_INCH:.2f}in)"
             )
             
-            # Expand for Shapes (Charts, Images)
-            for shape in sheet.Shapes:
-                try:
-                    shape_right = shape.Left + shape.Width
-                    shape_bottom = shape.Top + shape.Height
-                    
-                    if shape_right > max_width:
-                        logger.debug(f"Shape '{shape.Name}' extends width to {shape_right:.1f}pt ({shape_right/POINTS_PER_INCH:.2f}in)")
-                        max_width = shape_right
-                    if shape_bottom > max_height:
-                        max_height = shape_bottom
-                    
-                    try:
-                        br_cell = shape.BottomRightCell
-                        if br_cell:
-                            if br_cell.Row > last_row:
-                                last_row = br_cell.Row
-                            if br_cell.Column > last_col:
-                                last_col = br_cell.Column
-                    except Exception:
-                        pass
-                        
-                except Exception:
-                    continue
+            # Expand for Shapes (Charts, Images) with safe iteration
+            max_width, max_height, last_row, last_col = self._expand_bounds_for_shapes(
+                sheet, max_width, max_height, last_row, last_col, POINTS_PER_INCH
+            )
             
             logger.info(
                 f"Sheet '{sheet.Name}' Final Content Dimensions: "

@@ -21,6 +21,21 @@ FileType = Literal["word", "excel", "powerpoint"]
 
 
 @dataclass
+class TimeoutSettings:
+    """Settings for operation timeouts."""
+    document_parsing: Optional[int] = 3600  # seconds (1 hour default)
+    excel_trim: Optional[int] = 3600  # seconds (1 hour default)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TimeoutSettings":
+        """Create TimeoutSettings from dictionary."""
+        return cls(
+            document_parsing=data.get("document_parsing", 3600),
+            excel_trim=data.get("excel_trim", 3600)
+        )
+
+
+@dataclass
 class TrimWhitespaceSettings:
     """Settings for PDF whitespace trimming."""
     enabled: bool = False
@@ -284,6 +299,21 @@ def get_pdf_handling_config() -> PdfHandlingSettings:
     
     return PdfHandlingSettings.from_dict(pdf_handling_data)
 
+
+def get_timeout_config() -> TimeoutSettings:
+    """
+    Get timeout configuration with defaults.
+    
+    Returns:
+        TimeoutSettings object with document_parsing and excel_trim timeout values.
+    """
+    config = load_config()
+    timeout_data = config.get("timeout", {})
+    
+    if not timeout_data:
+        return TimeoutSettings()
+    
+    return TimeoutSettings.from_dict(timeout_data)
 
 
 def _merge_dict(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:

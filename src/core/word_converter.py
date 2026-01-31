@@ -99,6 +99,9 @@ class WordConverter(Converter):
                     # Prepare Export Arguments
                     export_args = self._map_settings(settings, str(out_file))
                     
+                    # Re-assert dialog suppression before export
+                    word.DisplayAlerts = wdAlertsNone
+                    
                     # Export with timeout protection
                     logger.info(f"Exporting '{input_file.name}' to PDF format...")
                     self._safe_com_call(lambda: doc.ExportAsFixedFormat(**export_args), timeout=120)
@@ -131,6 +134,21 @@ class WordConverter(Converter):
             word.Options.CheckGrammarAsYouType = False
             # Don't show recent files dialog
             word.Options.UpdateLinksAtOpen = False
+            # Prevent Office feature installation dialogs
+            try:
+                word.FeatureInstall = 0  # msoFeatureInstallNone
+            except:
+                pass
+            # Disable file validation popups
+            try:
+                word.FileValidation = 0  # msoFileValidationSkip
+            except:
+                pass
+            # Disable background saves that might trigger dialogs
+            try:
+                word.Options.BackgroundSave = False
+            except:
+                pass
             ProcessRegistry.register(word)
             yield word
         except Exception as e:

@@ -106,6 +106,9 @@ class PowerPointConverter(Converter):
                     # Prepare Export Arguments
                     export_args = self._map_settings(settings, str(out_file))
                     
+                    # Re-assert dialog suppression before export
+                    ppt.DisplayAlerts = ppAlertsNone
+                    
                     # Export to PDF with timeout protection
                     logger.info(f"Exporting '{input_file.name}' to PDF format...")
                     self._safe_com_call(lambda: presentation.ExportAsFixedFormat(**export_args), timeout=120)
@@ -138,6 +141,16 @@ class PowerPointConverter(Converter):
             ppt.AutomationSecurity = msoAutomationSecurityForceDisable
             # Disable events that might trigger dialogs
             ppt.EnableEvents = False
+            # Prevent Office feature installation dialogs
+            try:
+                ppt.FeatureInstall = 0  # msoFeatureInstallNone
+            except:
+                pass
+            # Disable file validation popups
+            try:
+                ppt.FileValidation = 0  # msoFileValidationSkip
+            except:
+                pass
             ProcessRegistry.register(ppt)
             yield ppt
         except Exception as e:

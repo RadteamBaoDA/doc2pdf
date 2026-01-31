@@ -38,6 +38,112 @@ from .config import (
     set_config_path, get_config_path
 )
 
+
+class RealtimeReportWriter:
+    """
+    Writes conversion reports in realtime.
+    - Errors are written immediately when they occur
+    - Successful files are tracked and written as they complete
+    """
+    
+    def __init__(self, reports_dir: Path, input_path: Path, output_path: Path, timestamp: str):
+        self.reports_dir = reports_dir
+        self.input_path = input_path
+        self.output_path = output_path
+        self.timestamp = timestamp
+        self.error_count = 0
+        self.success_count = 0
+        self.skipped_count = 0
+        self._lock = threading.Lock()
+        
+        # Create reports directory
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize report files with headers
+        self._init_error_report()
+        self._init_summary_report()
+    
+    def _init_error_report(self):
+        """Initialize error report file with header."""
+        self.error_path = self.reports_dir / f"error_{self.timestamp}.txt"
+        with open(self.error_path, "w", encoding="utf-8") as f:
+            f.write(f"doc2pdf Error Report (Realtime)\n")
+            f.write(f"{'='*50}\n")
+            f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Input: {self.input_path}\n")
+            f.write(f"Output: {self.output_path}\n\n")
+            f.write(f"Errors:\n")
+            f.write(f"{'-'*50}\n")
+    
+    def _init_summary_report(self):
+        """Initialize summary report file with header."""
+        self.summary_path = self.reports_dir / f"summary_{self.timestamp}.txt"
+        with open(self.summary_path, "w", encoding="utf-8") as f:
+            f.write(f"doc2pdf Conversion Summary (Realtime)\n")
+            f.write(f"{'='*50}\n")
+            f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Input: {self.input_path}\n")
+            f.write(f"Output: {self.output_path}\n\n")
+            f.write(f"Successfully Converted Files:\n")
+            f.write(f"{'-'*50}\n")
+    
+    def write_error(self, input_file: Path, output_file: Path, error_msg: str):
+        """Write an error entry immediately to the error report."""
+        with self._lock:
+            self.error_count += 1
+            with open(self.error_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[{self.error_count}] {input_file.name}\n")
+                f.write(f"    Time:   {datetime.now().strftime('%H:%M:%S')}\n")
+                f.write(f"    Input:  {input_file}\n")
+                f.write(f"    Output: {output_file}\n")
+                f.write(f"    Error:  {error_msg}\n")
+    
+    def write_success(self, input_file: Path, output_file: Path, file_type: str):
+        """Write a success entry immediately to the summary report."""
+        with self._lock:
+            self.success_count += 1
+            with open(self.summary_path, "a", encoding="utf-8") as f:
+                f.write(f"[{self.success_count}] {input_file.name}\n")
+                f.write(f"    Time:   {datetime.now().strftime('%H:%M:%S')}\n")
+                f.write(f"    Type:   {file_type}\n")
+                f.write(f"    Input:  {input_file}\n")
+                f.write(f"    Output: {output_file}\n\n")
+    
+    def write_skipped(self, input_file: Path, reason: str):
+        """Track skipped file."""
+        with self._lock:
+            self.skipped_count += 1
+    
+    def finalize(self, total_files: int):
+        """Write final summary statistics to both reports."""
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Finalize summary report
+        with open(self.summary_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'-'*50}\n")
+            f.write(f"Completed: {end_time}\n\n")
+            f.write(f"Final Results:\n")
+            f.write(f"  Success: {self.success_count}\n")
+            f.write(f"  Failed:  {self.error_count}\n")
+            f.write(f"  Skipped: {self.skipped_count}\n")
+            f.write(f"  Total:   {total_files}\n")
+        
+        # Finalize error report
+        with open(self.error_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'-'*50}\n")
+            f.write(f"Completed: {end_time}\n")
+            f.write(f"Total Errors: {self.error_count}\n")
+        
+        # Remove error report if no errors occurred
+        if self.error_count == 0:
+            try:
+                self.error_path.unlink()
+            except:
+                pass
+            return None
+        
+        return self.error_path
+
 app = typer.Typer(
     name="doc2pdf",
     help="""
@@ -270,7 +376,8 @@ def convert(
 
                 try:
                     def progress_callback(amount: float):
-                        progress.advance(task_id, advance=amount)
+                        # Only update TUI display, don't advance progress bar
+                        # Progress bar advances by 1 per file after conversion completes
                         tui_ctx.update_progress(progress)
                     
                     converted_pdf = None
@@ -283,6 +390,8 @@ def convert(
                         )
                         converted_pdf = target_file
                         success_count += 1
+                        if report_writer:
+                            report_writer.write_success(file_path, target_file, file_type)
                         progress.advance(task_id, advance=1)
                     elif file_type == "powerpoint":
                         run_with_timeout(
@@ -292,6 +401,8 @@ def convert(
                         )
                         converted_pdf = target_file
                         success_count += 1
+                        if report_writer:
+                            report_writer.write_success(file_path, target_file, file_type)
                         progress.advance(task_id, advance=1)
                     elif file_type == "excel":
                         run_with_timeout(
@@ -301,6 +412,9 @@ def convert(
                         )
                         converted_pdf = target_file
                         success_count += 1
+                        if report_writer:
+                            report_writer.write_success(file_path, target_file, file_type)
+                        progress.advance(task_id, advance=1)
                     elif file_type == "pdf":
                         # Log full path
                         logger.info(f"Input PDF found: {file_path}")
@@ -312,6 +426,8 @@ def convert(
                              logger.info(f"Copied PDF to: {target_file}")
                              converted_pdf = target_file
                              success_count += 1
+                             if report_writer:
+                                 report_writer.write_success(file_path, target_file, file_type)
                         else:
                              # Just skip or count as success? 
                              # If we don't copy, we essentially "skipped" processing it, but it was "handled".
@@ -325,6 +441,8 @@ def convert(
                              if not pdf_handling.copy_to_output:
                                  logger.debug(f"PDF copy disabled. Skipping copy for {file_path.name}")
                                  skipped_count += 1
+                                 if report_writer:
+                                     report_writer.write_skipped(file_path, "PDF copy disabled")
                              else:
                                  # This branch is for when target_file is None (dry run?) or copy succeeded
                                  pass 
@@ -333,6 +451,8 @@ def convert(
                     else:
                         logger.warning(f"Conversion for {file_type} not supported. Skipping {file_path.name}")
                         skipped_count += 1
+                        if report_writer:
+                            report_writer.write_skipped(file_path, f"File type '{file_type}' not supported")
                         progress.advance(task_id, advance=1)
                     
                     if converted_pdf and should_trim and converted_pdf.exists():
@@ -359,26 +479,33 @@ def convert(
                     error_msg = f"Conversion timed out: {timeout_err}"
                     failed_files.append((file_path, target_file, error_msg))
                     logger.error(f"Failed to convert {file_path.name}: {error_msg}")
+                    # Write error to report immediately
+                    if report_writer:
+                        report_writer.write_error(file_path, target_file, error_msg)
                     progress.advance(task_id, advance=1)
                 except Exception as e:
                     # Thread-safe counter update
                     fail_count += 1
                     failed_files.append((file_path, target_file, str(e)))
                     logger.error(f"Failed to convert {file_path}: {e}")
+                    # Write error to report immediately
+                    if report_writer:
+                        report_writer.write_error(file_path, target_file, str(e))
                     progress.advance(task_id, advance=1)
-                
-                # Sync progress bar
-                current_completed = progress.tasks[task_id].completed
-                target_completed = (files.index(file_path) + 1)
-                remaining = target_completed - current_completed
-                if remaining > 0:
-                    progress.advance(task_id, remaining)
                 
                 tui_ctx.update_progress(progress)
 
         finally:
             pythoncom.CoUninitialize()
 
+    # Initialize realtime report writer
+    reporting_config = get_reporting_config()
+    report_writer = None
+    if reporting_config.enabled:
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        reports_dir = Path(reporting_config.reports_dir)
+        report_writer = RealtimeReportWriter(reports_dir, input_path, output_path, timestamp)
+    
     try:
         with Live(tui_ctx.layout, refresh_per_second=10, screen=True) as live:
             # Store live context for sink
@@ -445,62 +572,30 @@ def convert(
     console.print(table)
     console.print(f"Logs available in: [bold]{current_config['file'].get('path', 'logs/')}[/bold]")
     
-    # Generate reports if enabled
-    reporting_config = get_reporting_config()
-    if reporting_config.enabled:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        reports_dir = Path(reporting_config.reports_dir)
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Summary report
-        if reporting_config.summary.enabled:
-            summary_filename = reporting_config.summary.format.replace("{timestamp}", timestamp)
-            summary_path = reports_dir / summary_filename
-            with open(summary_path, "w", encoding="utf-8") as f:
-                f.write(f"doc2pdf Conversion Summary\n")
-                f.write(f"{'='*50}\n")
-                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Input: {input_path}\n")
-                f.write(f"Output: {output_path}\n\n")
-                f.write(f"Results:\n")
-                f.write(f"  Success: {success_count}\n")
-                f.write(f"  Failed:  {fail_count}\n")
-                f.write(f"  Skipped: {skipped_count}\n")
-                f.write(f"  Total:   {len(files)}\n")
-            console.print(f"Summary report: [bold]{summary_path}[/bold]")
-        
-        # Error log with file paths
-        if reporting_config.error_log.enabled and failed_files:
-            error_filename = reporting_config.error_log.format.replace("{timestamp}", timestamp)
-            error_path = reports_dir / error_filename
-            with open(error_path, "w", encoding="utf-8") as f:
-                f.write(f"doc2pdf Error Report\n")
-                f.write(f"{'='*50}\n")
-                f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                for i, (input_file, output_file, error_msg) in enumerate(failed_files, 1):
-                    f.write(f"[{i}] {input_file.name}\n")
-                    f.write(f"    Input:  {input_file}\n")
-                    f.write(f"    Output: {output_file}\n")
-                    f.write(f"    Error:  {error_msg}\n\n")
-            console.print(f"Error report: [bold]{error_path}[/bold]")
-        
-        # Copy error files to separate folder (preserving input folder structure)
-        if reporting_config.copy_error_files.enabled and failed_files:
-            errors_dir = output_path / reporting_config.copy_error_files.target_dir
-            errors_dir.mkdir(parents=True, exist_ok=True)
-            for input_file, _, _ in failed_files:
-                try:
-                    # Preserve folder structure relative to input_path
-                    if input_path.is_dir():
-                        rel_path = input_file.relative_to(input_path)
-                        dest = errors_dir / rel_path
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                    else:
-                        dest = errors_dir / input_file.name
-                    shutil.copy2(input_file, dest)
-                except Exception as copy_err:
-                    logger.warning(f"Could not copy error file {input_file.name}: {copy_err}")
-            console.print(f"Error files copied to: [bold]{errors_dir}[/bold]")
+    # Finalize realtime reports
+    if report_writer:
+        report_writer.finalize(len(files))
+        console.print(f"Summary report: [bold]{report_writer.summary_path}[/bold]")
+        if report_writer.error_count > 0:
+            console.print(f"Error report: [bold]{report_writer.error_path}[/bold]")
+    
+    # Copy error files to separate folder (preserving input folder structure)
+    if reporting_config.enabled and reporting_config.copy_error_files.enabled and failed_files:
+        errors_dir = output_path / reporting_config.copy_error_files.target_dir
+        errors_dir.mkdir(parents=True, exist_ok=True)
+        for input_file, _, _ in failed_files:
+            try:
+                # Preserve folder structure relative to input_path
+                if input_path.is_dir():
+                    rel_path = input_file.relative_to(input_path)
+                    dest = errors_dir / rel_path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest = errors_dir / input_file.name
+                shutil.copy2(input_file, dest)
+            except Exception as copy_err:
+                logger.warning(f"Could not copy error file {input_file.name}: {copy_err}")
+        console.print(f"Error files copied to: [bold]{errors_dir}[/bold]")
     
 if __name__ == "__main__":
     app()

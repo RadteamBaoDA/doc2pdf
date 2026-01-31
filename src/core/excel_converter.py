@@ -330,12 +330,12 @@ class ExcelConverter(Converter):
         try:
             excel = win32com.client.Dispatch("Excel.Application")
             excel.Visible = False
-            # Suppress ALL alerts and dialogs
+            # Suppress ALL alerts and dialogs - MUST be set before any other operations
             excel.DisplayAlerts = False
             excel.ScreenUpdating = False
             # Disable macro/automation security prompts
             excel.AutomationSecurity = msoAutomationSecurityForceDisable
-            # Disable interactive mode - no user prompts
+            # Disable interactive mode - no user prompts (critical for printer dialogs)
             excel.Interactive = False
             # Disable events that might trigger dialogs
             excel.EnableEvents = False
@@ -343,8 +343,23 @@ class ExcelConverter(Converter):
             excel.AskToUpdateLinks = False
             # Suppress clipboard prompts
             excel.CutCopyMode = False
+            # Disable print communication errors that might show dialogs
+            try:
+                excel.PrintCommunication = False
+            except:
+                pass  # Not available in all Excel versions
+            # Prevent Office feature installation dialogs
+            try:
+                excel.FeatureInstall = 0  # msoFeatureInstallNone
+            except:
+                pass
+            # Disable file validation popups
+            try:
+                excel.FileValidation = 0  # msoFileValidationSkip
+            except:
+                pass
             
-            # Try to set optimal printer
+            # Try to set optimal printer (must be after DisplayAlerts=False)
             self._set_optimal_printer(excel)
             
             ProcessRegistry.register(excel)
@@ -384,6 +399,8 @@ class ExcelConverter(Converter):
         """
         Attempt to set ActivePrinter to 'Microsoft Print to PDF' for better paper size support.
         Uses win32print API for reliable port detection, with brute-force fallback.
+        
+        IMPORTANT: Avoids printers with PORTPROMPT: port which would show a dialog.
         """
         target_name = "Microsoft Print to PDF"
         
@@ -414,21 +431,32 @@ class ExcelConverter(Converter):
         except Exception as e:
             logger.debug(f"OpenPrinter/GetPrinter API failed for '{target_name}': {e}")
 
-        # If we got a port name from the API and it's not PORTPROMPT, try it first
+        # CRITICAL: Skip if port is PORTPROMPT: - this WILL show a dialog
+        if port_name and port_name.upper() == 'PORTPROMPT:':
+            logger.warning(
+                f"Printer '{target_name}' uses PORTPROMPT: which would show a dialog. "
+                f"Skipping printer change to avoid UI interruption."
+            )
+            return
+
+        # If we got a port name from the API, try it first
         candidates = []
-        if port_name and port_name.upper() != 'PORTPROMPT:':
+        if port_name:
             candidates.append(f"{target_name} on {port_name}")
         
         # Strategy 2: Brute force Ne00-Ne99 as fallback (expanded range)
         for i in range(100):
             candidates.append(f"{target_name} on Ne{i:02d}:")
             
-        # Strategy 3: Naked name (rare)
+        # Strategy 3: Naked name (rare, but might work)
         candidates.append(target_name)
         
         success = False
         for candidate in candidates:
             try:
+                # Ensure dialogs are suppressed before each attempt
+                excel.DisplayAlerts = False
+                excel.Interactive = False
                 excel.ActivePrinter = candidate
                 logger.info(f"Successfully switched ActivePrinter to: '{candidate}'")
                 success = True
@@ -441,8 +469,7 @@ class ExcelConverter(Converter):
         if not success:
             logger.warning(
                 f"Could not set ActivePrinter to '{target_name}'. "
-                f"Using default: '{excel.ActivePrinter}'. "
-                "Large paper sizes (A3) may rely on the default printer's capabilities."
+                f"Using default printer. Large paper sizes (A3) may rely on default printer capabilities."
             )
 
     def _get_sheets_to_export(self, workbook, excel_settings: ExcelSettings) -> List:
@@ -587,7 +614,15 @@ class ExcelConverter(Converter):
         
         # Quick validation: try to access the object type
         try:
-            _ = page_setup.Application
+            app = page_setup.Application
+            # Ensure dialogs are suppressed before setting paper size
+            app.DisplayAlerts = False
+            app.Interactive = False
+            # Disable print communication to prevent printer dialogs
+            try:
+                app.PrintCommunication = False
+            except:
+                pass
         except Exception:
             logger.debug(f"Cannot set paper size to {paper_name}: PageSetup object is invalid")
             return False
@@ -686,6 +721,19 @@ class ExcelConverter(Converter):
         """
         try:
             page_setup = sheet.PageSetup
+            
+            # Ensure dialogs are suppressed before any PageSetup operations
+            try:
+                app = sheet.Application
+                app.DisplayAlerts = False
+                app.Interactive = False
+                # PrintCommunication=False prevents printer driver dialogs
+                try:
+                    app.PrintCommunication = False
+                except:
+                    pass
+            except:
+                pass
             
             # Calculate smart page size
             page_width, page_height = self._calculate_smart_page_size(
@@ -1154,6 +1202,15 @@ class ExcelConverter(Converter):
         COPY_TIMEOUT = 30  # 30 seconds per sheet copy
         
         try:
+            # Ensure dialogs are suppressed before export
+            app = workbook.Application
+            app.DisplayAlerts = False
+            app.Interactive = False
+            try:
+                app.PrintCommunication = False
+            except:
+                pass
+            
             # Determine quality
             quality = xlQualityStandard
             if settings.optimization.image_quality == "low":

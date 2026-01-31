@@ -222,16 +222,16 @@ class ExcelConverter(Converter):
                                     start_row = i * row_lim + 1
                                     end_row = min((i + 1) * row_lim, last_row)
                                     
-                                    # Copy sheet to end
+                                    # Copy sheet to end with timeout protection
                                     last_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                    sheet.Copy(None, last_sheet)
+                                    self._safe_com_call(lambda s=sheet, ls=last_sheet: s.Copy(None, ls), timeout=30)
                                     new_sheet = workbook.Sheets(workbook.Sheets.Count)
                                     
                                     temp_sheets_to_delete.append(new_sheet)
                                     
                                     # Set Print Area explicitly to True content columns
                                     # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
-                                    new_sheet.PageSetup.PrintArea = f"$A${start_row}:${last_col_alpha}${end_row}"
+                                    self._safe_set_page_property(new_sheet.PageSetup, 'PrintArea', f"$A${start_row}:${last_col_alpha}${end_row}")
                                     
                                     # Create chunk settings
                                     chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
@@ -264,7 +264,7 @@ class ExcelConverter(Converter):
                                     continue
                                     
                                 # Set print area to avoid printing 1000 blank pages of formatting
-                                sheet.PageSetup.PrintArea = f"$A$1:${last_col_alpha}${last_row}"
+                                self._safe_set_page_property(sheet.PageSetup, 'PrintArea', f"$A$1:${last_col_alpha}${last_row}")
                                 
                                 self._apply_page_setup(
                                     sheet, 
@@ -304,17 +304,20 @@ class ExcelConverter(Converter):
                     logger.error(f"Failed to convert {input_file.name}: {e}")
                     raise
                 finally:
-                    # Cleanup temps
+                    # Cleanup temps with timeout protection
                     if temp_sheets_to_delete:
-                        excel.DisplayAlerts = False
+                        try:
+                            excel.DisplayAlerts = False
+                        except:
+                            pass
                         for t in temp_sheets_to_delete:
                             try:
-                                t.Delete()
+                                self._safe_com_call(lambda: t.Delete(), timeout=3)
                             except:
                                 pass
                     
                     if workbook:
-                        workbook.Close(SaveChanges=False)
+                        self._safe_com_call(lambda: workbook.Close(SaveChanges=False), timeout=5)
         finally:
             pythoncom.CoUninitialize()
             
@@ -571,6 +574,47 @@ class ExcelConverter(Converter):
         if error[0]:
             logger.debug(f"Failed to set paper size to {paper_name}: {error[0]}")
             return False
+            
+        return result[0]
+
+    def _safe_com_call(self, func, timeout: int = 10, default=None):
+        """
+        Execute a COM call with timeout protection.
+        
+        This is a general-purpose wrapper for any COM operation that might hang.
+        Used for operations like workbook.Close(), sheet.Copy(), ExportAsFixedFormat(), etc.
+        
+        Args:
+            func: Lambda or callable to execute
+            timeout: Maximum time to wait in seconds
+            default: Value to return if timeout or error occurs
+            
+        Returns:
+            Result of func() or default if timed out/failed
+        """
+        import threading
+        
+        result = [default]
+        error = [None]
+        
+        def execute():
+            try:
+                result[0] = func()
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=execute)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            logger.warning(f"COM operation timed out after {timeout}s")
+            return default
+        
+        if error[0]:
+            logger.debug(f"COM operation failed: {error[0]}")
+            raise error[0]
             
         return result[0]
 
@@ -1101,6 +1145,10 @@ class ExcelConverter(Converter):
             output_path: Path for output PDF
             settings: PDF conversion settings
         """
+        # Timeout for export operations - longer for large documents
+        EXPORT_TIMEOUT = 120  # 2 minutes per export operation
+        COPY_TIMEOUT = 30  # 30 seconds per sheet copy
+        
         try:
             # Determine quality
             quality = xlQualityStandard
@@ -1110,21 +1158,25 @@ class ExcelConverter(Converter):
             if len(sheets) == 1:
                 # Export single sheet directly
                 logger.info(f"Exporting sheet '{sheets[0].Name}' to PDF...")
-                sheets[0].ExportAsFixedFormat(
-                    Type=xlTypePDF,
-                    Filename=output_path,
-                    Quality=quality,
-                    IncludeDocProperties=settings.metadata.include_properties,
-                    IgnorePrintAreas=False,
-                    OpenAfterPublish=False
-                )
+                
+                def do_single_export():
+                    sheets[0].ExportAsFixedFormat(
+                        Type=xlTypePDF,
+                        Filename=output_path,
+                        Quality=quality,
+                        IncludeDocProperties=settings.metadata.include_properties,
+                        IgnorePrintAreas=False,
+                        OpenAfterPublish=False
+                    )
+                
+                self._safe_com_call(do_single_export, timeout=EXPORT_TIMEOUT)
                 logger.debug(f"Sheet '{sheets[0].Name}' exported successfully")
             else:
                 # Multiple sheets: Copy to new temporary workbook iteratively
                 logger.debug(f"Preparing to copy {len(sheets)} sheets to new workbook.")
                 
-                # Copy first sheet -> Creates new Workbook
-                sheets[0].Copy()
+                # Copy first sheet -> Creates new Workbook (with timeout)
+                self._safe_com_call(lambda: sheets[0].Copy(), timeout=COPY_TIMEOUT)
                 temp_wb = workbook.Application.ActiveWorkbook
                 
                 logger.debug(f"Created temp WB. Sheets count: {temp_wb.Sheets.Count}")
@@ -1135,7 +1187,7 @@ class ExcelConverter(Converter):
                         last_sheet = temp_wb.Sheets(temp_wb.Sheets.Count)
                         # Use positional arguments for Copy: Copy(Before, After)
                         # s.Copy(None, last_sheet) -> Copy After last_sheet
-                        s.Copy(None, last_sheet)
+                        self._safe_com_call(lambda sh=s, ls=last_sheet: sh.Copy(None, ls), timeout=COPY_TIMEOUT)
                         logger.debug(f"Copied sheet {idx}/{len(sheets)}. New count: {temp_wb.Sheets.Count}")
                     except Exception as copy_err:
                         logger.error(f"Failed to copy sheet {idx}: {copy_err}")
@@ -1154,17 +1206,21 @@ class ExcelConverter(Converter):
                     logger.debug(f"Selected {sel_count} sheets for export.")
                     
                     logger.info(f"Exporting {sel_count} sheets to PDF...")
-                    temp_wb.ExportAsFixedFormat(
-                        Type=xlTypePDF,
-                        Filename=output_path,
-                        Quality=quality,
-                        IncludeDocProperties=settings.metadata.include_properties,
-                        IgnorePrintAreas=False,
-                        OpenAfterPublish=False
-                    )
+                    
+                    def do_multi_export():
+                        temp_wb.ExportAsFixedFormat(
+                            Type=xlTypePDF,
+                            Filename=output_path,
+                            Quality=quality,
+                            IncludeDocProperties=settings.metadata.include_properties,
+                            IgnorePrintAreas=False,
+                            OpenAfterPublish=False
+                        )
+                    
+                    self._safe_com_call(do_multi_export, timeout=EXPORT_TIMEOUT)
                     logger.debug(f"Multi-sheet export completed successfully")
                 finally:
-                    temp_wb.Close(SaveChanges=False)
+                    self._safe_com_call(lambda: temp_wb.Close(SaveChanges=False), timeout=10)
 
             
         except Exception as e:

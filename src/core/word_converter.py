@@ -1,4 +1,5 @@
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 import win32com.client
@@ -99,9 +100,9 @@ class WordConverter(Converter):
                     # Prepare Export Arguments
                     export_args = self._map_settings(settings, str(out_file))
                     
-                    # Export
+                    # Export with timeout protection
                     logger.info(f"Exporting '{input_file.name}' to PDF format...")
-                    doc.ExportAsFixedFormat(**export_args)
+                    self._safe_com_call(lambda: doc.ExportAsFixedFormat(**export_args), timeout=120)
                     
                     logger.success(f"Successfully converted: {out_file}")
                     
@@ -110,7 +111,7 @@ class WordConverter(Converter):
                     raise
                 finally:
                     if doc:
-                        doc.Close(SaveChanges=wdDoNotSaveChanges)
+                        self._safe_com_call(lambda: doc.Close(SaveChanges=wdDoNotSaveChanges), timeout=10)
         finally:
             pythoncom.CoUninitialize()
             
@@ -144,7 +145,55 @@ class WordConverter(Converter):
                 # Ideally we check if we created it or not, but strictly quitting is safer for batch processing CLI.
                 # However, Dispatch creates a new connection. `DispatchEx` enforces new instance. 
                 # Using standard Dispatch.
-                word.Quit()
+                self._safe_quit(word)
+
+    def _safe_quit(self, app, timeout_seconds: int = 5) -> None:
+        """Safely quit application with timeout protection."""
+        result = [False]
+        
+        def quit_app():
+            try:
+                app.DisplayAlerts = wdAlertsNone
+            except:
+                pass
+            try:
+                app.Quit()
+                result[0] = True
+            except Exception as e:
+                logger.debug(f"App.Quit() raised: {e}")
+        
+        thread = threading.Thread(target=quit_app)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout_seconds)
+        
+        if not result[0]:
+            logger.warning(f"Word.Quit() timed out or failed after {timeout_seconds}s")
+
+    def _safe_com_call(self, func, timeout: int = 60, default=None):
+        """Execute a COM call with timeout protection."""
+        result = [default]
+        error = [None]
+        
+        def execute():
+            try:
+                result[0] = func()
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=execute)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            logger.warning(f"COM operation timed out after {timeout}s")
+            return default
+        
+        if error[0]:
+            raise error[0]
+            
+        return result[0]
 
     def _apply_page_setup(self, doc, layout: LayoutSettings):
         """

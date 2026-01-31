@@ -2,6 +2,7 @@
 PowerPoint to PDF Converter using pywin32 COM.
 """
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 import win32com.client
@@ -106,9 +107,9 @@ class PowerPointConverter(Converter):
                     # Prepare Export Arguments
                     export_args = self._map_settings(settings, str(out_file))
                     
-                    # Export to PDF
+                    # Export to PDF with timeout protection
                     logger.info(f"Exporting '{input_file.name}' to PDF format...")
-                    presentation.ExportAsFixedFormat(**export_args)
+                    self._safe_com_call(lambda: presentation.ExportAsFixedFormat(**export_args), timeout=120)
                     
                     logger.success(f"Successfully converted: {out_file}")
                     
@@ -117,7 +118,7 @@ class PowerPointConverter(Converter):
                     raise
                 finally:
                     if presentation:
-                        presentation.Close()
+                        self._safe_com_call(lambda: presentation.Close(), timeout=10)
         finally:
             pythoncom.CoUninitialize()
             
@@ -146,7 +147,55 @@ class PowerPointConverter(Converter):
         finally:
             if ppt:
                 ProcessRegistry.unregister(ppt)
-                ppt.Quit()
+                self._safe_quit(ppt)
+
+    def _safe_quit(self, app, timeout_seconds: int = 5) -> None:
+        """Safely quit application with timeout protection."""
+        result = [False]
+        
+        def quit_app():
+            try:
+                app.DisplayAlerts = ppAlertsNone
+            except:
+                pass
+            try:
+                app.Quit()
+                result[0] = True
+            except Exception as e:
+                logger.debug(f"App.Quit() raised: {e}")
+        
+        thread = threading.Thread(target=quit_app)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout_seconds)
+        
+        if not result[0]:
+            logger.warning(f"PowerPoint.Quit() timed out or failed after {timeout_seconds}s")
+
+    def _safe_com_call(self, func, timeout: int = 60, default=None):
+        """Execute a COM call with timeout protection."""
+        result = [default]
+        error = [None]
+        
+        def execute():
+            try:
+                result[0] = func()
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=execute)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            logger.warning(f"COM operation timed out after {timeout}s")
+            return default
+        
+        if error[0]:
+            raise error[0]
+            
+        return result[0]
 
     def _map_settings(self, settings: PDFConversionSettings, output_path: str) -> dict:
         """

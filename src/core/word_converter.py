@@ -102,9 +102,9 @@ class WordConverter(Converter):
                     # Re-assert dialog suppression before export
                     word.DisplayAlerts = wdAlertsNone
                     
-                    # Export with timeout protection
+                    # Export directly (avoid lambda wrappers that may interfere with COM)
                     logger.info(f"Exporting '{input_file.name}' to PDF format...")
-                    self._safe_com_call(lambda: doc.ExportAsFixedFormat(**export_args), timeout=120)
+                    doc.ExportAsFixedFormat(**export_args)
                     
                     logger.success(f"Successfully converted: {out_file}")
                     
@@ -113,7 +113,10 @@ class WordConverter(Converter):
                     raise
                 finally:
                     if doc:
-                        self._safe_com_call(lambda: doc.Close(SaveChanges=wdDoNotSaveChanges), timeout=10)
+                        try:
+                            doc.Close(SaveChanges=wdDoNotSaveChanges)
+                        except Exception as close_err:
+                            logger.debug(f"Failed to close document: {close_err}")
         finally:
             pythoncom.CoUninitialize()
             

@@ -65,6 +65,11 @@ class OversizedSheetError(Exception):
     pass
 
 
+class COMDisconnectedError(Exception):
+    """Raised when Excel COM object has disconnected (crashed or became unavailable)."""
+    pass
+
+
 class ExcelConverter(Converter):
     """
     Converter for Excel documents (.xlsx, .xls, .xlsm, .xlsb) to PDF.
@@ -222,9 +227,9 @@ class ExcelConverter(Converter):
                                     start_row = i * row_lim + 1
                                     end_row = min((i + 1) * row_lim, last_row)
                                     
-                                    # Copy sheet to end with timeout protection
+                                    # Copy sheet to end
                                     last_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                    self._safe_com_call(lambda s=sheet, ls=last_sheet: s.Copy(None, ls), timeout=30)
+                                    sheet.Copy(None, last_sheet)
                                     new_sheet = workbook.Sheets(workbook.Sheets.Count)
                                     
                                     temp_sheets_to_delete.append(new_sheet)
@@ -302,9 +307,12 @@ class ExcelConverter(Converter):
                     
                 except Exception as e:
                     logger.error(f"Failed to convert {input_file.name}: {e}")
+                    # Check if it's a COM disconnection - provide clearer message
+                    if isinstance(e, COMDisconnectedError):
+                        logger.warning("Excel crashed or became unavailable. This file will be skipped.")
                     raise
                 finally:
-                    # Cleanup temps with timeout protection
+                    # Cleanup temps
                     if temp_sheets_to_delete:
                         try:
                             excel.DisplayAlerts = False
@@ -312,12 +320,15 @@ class ExcelConverter(Converter):
                             pass
                         for t in temp_sheets_to_delete:
                             try:
-                                self._safe_com_call(lambda: t.Delete(), timeout=3)
+                                t.Delete()
                             except:
                                 pass
                     
                     if workbook:
-                        self._safe_com_call(lambda: workbook.Close(SaveChanges=False), timeout=5)
+                        try:
+                            workbook.Close(SaveChanges=False)
+                        except:
+                            pass
         finally:
             pythoncom.CoUninitialize()
             
@@ -325,52 +336,105 @@ class ExcelConverter(Converter):
 
     @contextmanager
     def _excel_application(self):
-        """Context manager for Excel COM application lifecycle."""
+        """Context manager for Excel COM application lifecycle with retry on disconnection."""
         excel = None
+        max_retries = 2
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Kill any zombie Excel processes before starting (on retry)
+                if attempt > 0:
+                    logger.warning(f"Retrying Excel initialization (attempt {attempt + 1}/{max_retries + 1})...")
+                    self._kill_zombie_excel()
+                    import time
+                    time.sleep(1)  # Give OS time to clean up
+                
+                excel = win32com.client.Dispatch("Excel.Application")
+                
+                # Validate connection immediately by accessing a property
+                try:
+                    _ = excel.Version
+                except Exception as conn_err:
+                    logger.warning(f"Excel connection validation failed: {conn_err}")
+                    if attempt < max_retries:
+                        excel = None
+                        continue
+                    raise
+                
+                excel.Visible = False
+                # Suppress ALL alerts and dialogs - MUST be set before any other operations
+                excel.DisplayAlerts = False
+                excel.ScreenUpdating = False
+                # Disable macro/automation security prompts
+                excel.AutomationSecurity = msoAutomationSecurityForceDisable
+                # Disable interactive mode - no user prompts (critical for printer dialogs)
+                excel.Interactive = False
+                # Disable events that might trigger dialogs
+                excel.EnableEvents = False
+                # Don't prompt about links
+                excel.AskToUpdateLinks = False
+                # Suppress clipboard prompts
+                excel.CutCopyMode = False
+                # Disable print communication errors that might show dialogs
+                try:
+                    excel.PrintCommunication = False
+                except:
+                    pass  # Not available in all Excel versions
+                # Prevent Office feature installation dialogs
+                try:
+                    excel.FeatureInstall = 0  # msoFeatureInstallNone
+                except:
+                    pass
+                # Disable file validation popups
+                try:
+                    excel.FileValidation = 0  # msoFileValidationSkip
+                except:
+                    pass
+                
+                # Try to set optimal printer (must be after DisplayAlerts=False)
+                self._set_optimal_printer(excel)
+                
+                ProcessRegistry.register(excel)
+                break  # Success, exit retry loop
+                
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(f"Excel initialization failed (attempt {attempt + 1}): {e}")
+                    excel = None
+                    continue
+                logger.critical(f"Failed to initialize Microsoft Excel after {max_retries + 1} attempts: {e}")
+                raise
+        
         try:
-            excel = win32com.client.Dispatch("Excel.Application")
-            excel.Visible = False
-            # Suppress ALL alerts and dialogs - MUST be set before any other operations
-            excel.DisplayAlerts = False
-            excel.ScreenUpdating = False
-            # Disable macro/automation security prompts
-            excel.AutomationSecurity = msoAutomationSecurityForceDisable
-            # Disable interactive mode - no user prompts (critical for printer dialogs)
-            excel.Interactive = False
-            # Disable events that might trigger dialogs
-            excel.EnableEvents = False
-            # Don't prompt about links
-            excel.AskToUpdateLinks = False
-            # Suppress clipboard prompts
-            excel.CutCopyMode = False
-            # Disable print communication errors that might show dialogs
-            try:
-                excel.PrintCommunication = False
-            except:
-                pass  # Not available in all Excel versions
-            # Prevent Office feature installation dialogs
-            try:
-                excel.FeatureInstall = 0  # msoFeatureInstallNone
-            except:
-                pass
-            # Disable file validation popups
-            try:
-                excel.FileValidation = 0  # msoFileValidationSkip
-            except:
-                pass
-            
-            # Try to set optimal printer (must be after DisplayAlerts=False)
-            self._set_optimal_printer(excel)
-            
-            ProcessRegistry.register(excel)
             yield excel
-        except Exception as e:
-            logger.critical(f"Failed to initialize Microsoft Excel: {e}")
-            raise
         finally:
             if excel:
                 ProcessRegistry.unregister(excel)
                 self._safe_quit_excel(excel)
+
+    def _kill_zombie_excel(self) -> None:
+        """
+        Kill any zombie Excel processes that may be blocking COM.
+        
+        This is used as a recovery mechanism when Excel COM objects become
+        disconnected (error -2147417848 / RPC_E_DISCONNECTED).
+        """
+        try:
+            import subprocess
+            # Use taskkill to forcefully terminate Excel processes
+            result = subprocess.run(
+                ['taskkill', '/F', '/IM', 'EXCEL.EXE'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                logger.info("Killed zombie Excel processes")
+            else:
+                # No Excel processes found or access denied - that's OK
+                logger.debug(f"taskkill result: {result.stderr.strip()}")
+        except Exception as e:
+            logger.debug(f"Could not kill zombie Excel processes: {e}")
 
     def _safe_quit_excel(self, excel, timeout_seconds: int = 5) -> None:
         """
@@ -394,6 +458,8 @@ class ExcelConverter(Converter):
             logger.debug("Excel application closed successfully")
         except Exception as e:
             logger.debug(f"Excel.Quit() raised: {e}")
+            # If Quit fails, the process might be zombie - will be cleaned on next retry
+            pass
 
     def _set_optimal_printer(self, excel) -> None:
         """
@@ -658,10 +724,37 @@ class ExcelConverter(Converter):
             
         Returns:
             Result of func() or default if failed
+            
+        Raises:
+            COMDisconnectedError: If the COM object has disconnected
         """
         try:
             return func()
         except Exception as e:
+            error_str = str(e)
+            error_code = getattr(e, 'args', [None])[0] if hasattr(e, 'args') and e.args else None
+            
+            # Check for disconnection errors
+            # -2147417848 = RPC_E_DISCONNECTED (0x80010108)
+            # -2147023174 = RPC_S_SERVER_UNAVAILABLE
+            disconnection_codes = [-2147417848, -2147023174]
+            disconnection_phrases = [
+                'disconnected from its clients',
+                'RPC server is unavailable',
+                'Call was rejected by callee',
+                'server threw an exception'
+            ]
+            
+            is_disconnected = False
+            if isinstance(error_code, int) and error_code in disconnection_codes:
+                is_disconnected = True
+            elif any(phrase.lower() in error_str.lower() for phrase in disconnection_phrases):
+                is_disconnected = True
+            
+            if is_disconnected:
+                logger.error(f"Excel COM connection lost: {e}")
+                raise COMDisconnectedError(f"Excel has disconnected: {e}") from e
+            
             logger.debug(f"COM operation failed: {e}")
             raise
 
@@ -1197,13 +1290,15 @@ class ExcelConverter(Converter):
             output_path: Path for output PDF
             settings: PDF conversion settings
         """
-        # Timeout for export operations - longer for large documents
-        EXPORT_TIMEOUT = 120  # 2 minutes per export operation
-        COPY_TIMEOUT = 30  # 30 seconds per sheet copy
-        
         try:
+            # Validate COM connection before starting
+            try:
+                app = workbook.Application
+                _ = app.Version  # Quick validation
+            except Exception as e:
+                raise COMDisconnectedError(f"Excel connection lost before export: {e}")
+            
             # Ensure dialogs are suppressed before export
-            app = workbook.Application
             app.DisplayAlerts = False
             app.Interactive = False
             try:
@@ -1220,8 +1315,52 @@ class ExcelConverter(Converter):
                 # Export single sheet directly
                 logger.info(f"Exporting sheet '{sheets[0].Name}' to PDF...")
                 
-                def do_single_export():
-                    sheets[0].ExportAsFixedFormat(
+                sheets[0].ExportAsFixedFormat(
+                    Type=xlTypePDF,
+                    Filename=output_path,
+                    Quality=quality,
+                    IncludeDocProperties=settings.metadata.include_properties,
+                    IgnorePrintAreas=False,
+                    OpenAfterPublish=False
+                )
+                
+                logger.debug(f"Sheet '{sheets[0].Name}' exported successfully")
+            else:
+                # Multiple sheets: Copy to new temporary workbook iteratively
+                logger.debug(f"Preparing to copy {len(sheets)} sheets to new workbook.")
+                
+                temp_wb = None
+                try:
+                    # Copy first sheet -> Creates new Workbook
+                    sheets[0].Copy()
+                    
+                    # Get the new workbook
+                    try:
+                        temp_wb = workbook.Application.ActiveWorkbook
+                        _ = temp_wb.Sheets.Count  # Validate connection
+                    except Exception as e:
+                        raise COMDisconnectedError(f"Failed to access temp workbook: {e}")
+                    
+                    logger.debug(f"Created temp WB. Sheets count: {temp_wb.Sheets.Count}")
+                    
+                    # Copy remaining sheets into the new workbook
+                    for idx, s in enumerate(sheets[1:], start=2):
+                        try:
+                            last_sheet = temp_wb.Sheets(temp_wb.Sheets.Count)
+                            # Copy after last_sheet
+                            s.Copy(None, last_sheet)
+                            logger.debug(f"Copied sheet {idx}/{len(sheets)}. New count: {temp_wb.Sheets.Count}")
+                        except Exception as copy_err:
+                            logger.error(f"Failed to copy sheet {idx}: {copy_err}")
+                            # Continue with remaining sheets
+                    
+                    # Export workbook - all sheets will be included automatically
+                    count = temp_wb.Sheets.Count
+                    logger.debug(f"Exporting created workbook with {count} sheets.")
+                    
+                    logger.info(f"Exporting {count} sheets to PDF...")
+                    
+                    temp_wb.ExportAsFixedFormat(
                         Type=xlTypePDF,
                         Filename=output_path,
                         Quality=quality,
@@ -1229,61 +1368,18 @@ class ExcelConverter(Converter):
                         IgnorePrintAreas=False,
                         OpenAfterPublish=False
                     )
-                
-                self._safe_com_call(do_single_export, timeout=EXPORT_TIMEOUT)
-                logger.debug(f"Sheet '{sheets[0].Name}' exported successfully")
-            else:
-                # Multiple sheets: Copy to new temporary workbook iteratively
-                logger.debug(f"Preparing to copy {len(sheets)} sheets to new workbook.")
-                
-                # Copy first sheet -> Creates new Workbook (with timeout)
-                self._safe_com_call(lambda: sheets[0].Copy(), timeout=COPY_TIMEOUT)
-                temp_wb = workbook.Application.ActiveWorkbook
-                
-                logger.debug(f"Created temp WB. Sheets count: {temp_wb.Sheets.Count}")
-                
-                # Copy remaining sheets into the new workbook
-                for idx, s in enumerate(sheets[1:], start=2):
-                    try:
-                        last_sheet = temp_wb.Sheets(temp_wb.Sheets.Count)
-                        # Use positional arguments for Copy: Copy(Before, After)
-                        # s.Copy(None, last_sheet) -> Copy After last_sheet
-                        self._safe_com_call(lambda sh=s, ls=last_sheet: sh.Copy(None, ls), timeout=COPY_TIMEOUT)
-                        logger.debug(f"Copied sheet {idx}/{len(sheets)}. New count: {temp_wb.Sheets.Count}")
-                    except Exception as copy_err:
-                        logger.error(f"Failed to copy sheet {idx}: {copy_err}")
-                
-                try:
-                    # Select all sheets in the new workbook (Explicit)
-                    count = temp_wb.Sheets.Count
-                    logger.debug(f"Exporting created workbook with {count} sheets.")
                     
-                    if count > 1:
-                        temp_wb.Sheets(1).Select(Replace=True)
-                        for i in range(2, count + 1):
-                            temp_wb.Sheets(i).Select(Replace=False)
-                            
-                    sel_count = temp_wb.Windows(1).SelectedSheets.Count
-                    logger.debug(f"Selected {sel_count} sheets for export.")
-                    
-                    logger.info(f"Exporting {sel_count} sheets to PDF...")
-                    
-                    def do_multi_export():
-                        temp_wb.ExportAsFixedFormat(
-                            Type=xlTypePDF,
-                            Filename=output_path,
-                            Quality=quality,
-                            IncludeDocProperties=settings.metadata.include_properties,
-                            IgnorePrintAreas=False,
-                            OpenAfterPublish=False
-                        )
-                    
-                    self._safe_com_call(do_multi_export, timeout=EXPORT_TIMEOUT)
                     logger.debug(f"Multi-sheet export completed successfully")
                 finally:
-                    self._safe_com_call(lambda: temp_wb.Close(SaveChanges=False), timeout=10)
+                    if temp_wb:
+                        try:
+                            temp_wb.Close(SaveChanges=False)
+                        except Exception as close_err:
+                            logger.debug(f"Failed to close temp workbook: {close_err}")
 
             
+        except COMDisconnectedError:
+            raise  # Re-raise to caller
         except Exception as e:
             logger.error(f"Failed to export to PDF: {e}")
             raise

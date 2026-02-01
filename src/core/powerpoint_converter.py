@@ -91,14 +91,14 @@ class PowerPointConverter(Converter):
                 try:
                     # Open Presentation with all parameters to suppress dialogs
                     # FileName: Path to file
-                    # ReadOnly=True: Open read-only for safety
-                    # Untitled=False: Use original title
-                    # WithWindow=False: Don't show window (msoFalse)
+                    # ReadOnly=msoTrue: Open read-only for safety
+                    # Untitled=msoFalse: Use original title
+                    # WithWindow=msoFalse: Don't show window
                     presentation = ppt.Presentations.Open(
                         str(input_file), 
-                        ReadOnly=True, 
-                        Untitled=False, 
-                        WithWindow=False
+                        ReadOnly=-1,  # msoTrue
+                        Untitled=0,   # msoFalse
+                        WithWindow=0  # msoFalse
                     )
                     
                     # Prepare Export Arguments
@@ -107,9 +107,10 @@ class PowerPointConverter(Converter):
                     # Re-assert dialog suppression before export
                     ppt.DisplayAlerts = ppAlertsNone
                     
-                    # Export directly (avoid lambda wrappers that may interfere with COM)
+                    # Export directly using SaveAs with PDF format
+                    # This is more reliable than ExportAsFixedFormat with pywin32
                     logger.info(f"Exporting '{input_file.name}' to PDF format...")
-                    presentation.ExportAsFixedFormat(**export_args)
+                    presentation.SaveAs(str(out_file), 32)  # ppSaveAsPDF = 32
                     
                     logger.success(f"Successfully converted: {out_file}")
                     
@@ -222,20 +223,23 @@ class PowerPointConverter(Converter):
         if settings.optimization.image_quality == "low":
             intent = ppFixedFormatIntentScreen
         
+        # Helper to convert Python bool to COM bool
+        def to_com_bool(value):
+            return -1 if bool(value) else 0
+        
         export_args = {
-            "Path": output_path,
-            "FixedFormatType": ppFixedFormatTypePDF,
-            "Intent": intent,
-            "PrintRange": None,  # Use RangeType instead
-            "RangeType": range_type,
-            "FrameSlides": False,
-            "HandoutOrder": 1,  # ppPrintHandoutVerticalFirst
-            "OutputType": 1,  # ppPrintOutputSlides
-            "IncludeDocProps": settings.metadata.include_properties,
-            "KeepIRMSettings": True,
-            "DocStructureTags": settings.metadata.include_tags,
-            "BitmapMissingFonts": settings.optimization.bitmap_text,
-            "UseISO19005_1": (settings.compliance == "pdfa"),
+            "Path": str(output_path),
+            "FixedFormatType": int(ppFixedFormatTypePDF),
+            "Intent": int(intent),
+            "RangeType": int(range_type),
+            "FrameSlides": 0,
+            "HandoutOrder": 1,
+            "OutputType": 1,
+            "IncludeDocProperties": to_com_bool(settings.metadata.include_properties),
+            "KeepIRMSettings": -1,
+            "DocStructureTags": to_com_bool(settings.metadata.include_tags),
+            "BitmapMissingFonts": to_com_bool(settings.optimization.bitmap_text),
+            "UseISO19005_1": to_com_bool(settings.compliance == "pdfa"),
         }
         
         # Add slide range if specified

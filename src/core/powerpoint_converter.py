@@ -94,13 +94,11 @@ class PowerPointConverter(Converter):
                     # ReadOnly=True: Open read-only for safety
                     # Untitled=False: Use original title
                     # WithWindow=False: Don't show window (msoFalse)
-                    # OpenConflictDocument=False: Don't prompt about conflicts
                     presentation = ppt.Presentations.Open(
                         str(input_file), 
                         ReadOnly=True, 
                         Untitled=False, 
-                        WithWindow=False,
-                        OpenConflictDocument=False
+                        WithWindow=False
                     )
                     
                     # Prepare Export Arguments
@@ -142,8 +140,6 @@ class PowerPointConverter(Converter):
             ppt.DisplayAlerts = ppAlertsNone
             # Disable macro/automation security prompts
             ppt.AutomationSecurity = msoAutomationSecurityForceDisable
-            # Disable events that might trigger dialogs
-            ppt.EnableEvents = False
             # Prevent Office feature installation dialogs
             try:
                 ppt.FeatureInstall = 0  # msoFeatureInstallNone

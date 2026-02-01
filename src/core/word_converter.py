@@ -71,7 +71,6 @@ class WordConverter(Converter):
                     # WritePasswordTemplate="": No template write password prompt
                     # Format=wdOpenFormatAuto: Auto-detect format without asking
                     # Visible=False: Don't show document
-                    # OpenConflictDocument=False: Don't prompt about conflicts
                     # OpenAndRepair=False: Don't show repair dialog
                     # NoEncodingDialog=True: Don't show encoding selection dialog
                     doc = word.Documents.Open(
@@ -86,7 +85,6 @@ class WordConverter(Converter):
                         WritePasswordTemplate="",
                         Format=wdOpenFormatAuto,
                         Visible=False,
-                        OpenConflictDocument=False,
                         OpenAndRepair=False,
                         NoEncodingDialog=True
                     )

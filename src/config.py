@@ -91,6 +91,7 @@ class ExcelSettings:
     ocr_sheet_name_label: bool = False  # Insert sheet name as large text in row 1 for OCR
     is_write_file_path: bool = False  # Insert file path row before last row
     oversized_action: str = "error"  # Action for oversized sheets: 'error', 'skip', 'warn'
+    page_shrink_threshold: float = 0.10  # Allow shrinking up to 10% to fit on smaller paper
     
 @dataclass
 class SummaryReportSettings:
@@ -168,7 +169,7 @@ class PDFConversionSettings:
         # Excel settings can be in nested 'excel' key OR at top level
         excel_data = data.get("excel", {})
         # Also check for top-level excel settings (flat structure)
-        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor", "ocr_sheet_name_label", "is_write_file_path", "oversized_action"]
+        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor", "ocr_sheet_name_label", "is_write_file_path", "oversized_action", "page_shrink_threshold"]
         for key in top_level_excel_keys:
             if key in data:
                 # Top-level (flat) settings override nested 'excel' settings

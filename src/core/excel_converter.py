@@ -247,7 +247,8 @@ class ExcelConverter(Converter):
                                         chunk_settings, 
                                         input_file.name, 
                                         last_col, 
-                                        content_width_points=content_width
+                                        content_width_points=content_width,
+                                        content_height_points=content_height
                                     )
 
                                     if on_progress:
@@ -276,7 +277,8 @@ class ExcelConverter(Converter):
                                     sheet_excel_settings, 
                                     input_file.name, 
                                     last_col, 
-                                    content_width_points=content_width
+                                    content_width_points=content_width,
+                                    content_height_points=content_height
                                 )
                                 if sheet_excel_settings.metadata_header:
                                     self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
@@ -606,15 +608,17 @@ class ExcelConverter(Converter):
         self, 
         sheet, 
         last_col_index: int,
-        content_width_points: Optional[float] = None
+        content_width_points: Optional[float] = None,
+        content_height_points: Optional[float] = None
     ) -> Tuple[float, float]:
         """
-        Calculate page width based on actual column widths of used range.
+        Calculate page width and height based on actual content dimensions.
         
         Args:
             sheet: Excel Worksheet object
             last_col_index: The 1-based index of the last used column (e.g. 5 for Column E)
             content_width_points: Optional explicit content width in points.
+            content_height_points: Optional explicit content height in points.
             
         Returns:
             Tuple of (page_width_inches, page_height_inches)
@@ -640,12 +644,20 @@ class ExcelConverter(Converter):
             # Add a small buffer for margins (0.5 inch total)
             page_width = content_width_inches + 0.5
             
-            # Page height - defaults
-            page_height = self.DEFAULT_PAGE_HEIGHT_INCHES
+            # Page height - use actual content height if available
+            if content_height_points is not None and content_height_points > 0:
+                content_height_inches = content_height_points / self.POINTS_PER_INCH
+                # Add margin buffer: top (0.5-1") + bottom (0.5") + small padding
+                page_height = content_height_inches + 1.5
+                # Ensure minimum page height (at least 3 inches)
+                page_height = max(page_height, 3.0)
+            else:
+                page_height = self.DEFAULT_PAGE_HEIGHT_INCHES
             
             logger.debug(
                 f"Sheet '{sheet.Name}' (Cols 1-{last_col_index}): "
-                f"Content Width: {content_width_inches:.2f}\" -> Page Width (w/ margins): {page_width:.2f}\""
+                f"Content Width: {content_width_inches:.2f}\" -> Page Width (w/ margins): {page_width:.2f}\" | "
+                f"Page Height: {page_height:.2f}\""
             )
             
             return page_width, page_height
@@ -815,7 +827,8 @@ class ExcelConverter(Converter):
         excel_settings: ExcelSettings,
         filename: str,
         last_col: int,
-        content_width_points: Optional[float] = None
+        content_width_points: Optional[float] = None,
+        content_height_points: Optional[float] = None
     ) -> None:
         """
         Apply page setup settings for OCR-optimized PDF output.
@@ -826,6 +839,7 @@ class ExcelConverter(Converter):
             filename: Original filename for header
             last_col: Last used column index for width calculation
             content_width_points: Optional total content width in points
+            content_height_points: Optional total content height in points
         """
         try:
             page_setup = sheet.PageSetup
@@ -843,123 +857,235 @@ class ExcelConverter(Converter):
             page_width, page_height = self._calculate_smart_page_size(
                 sheet, 
                 last_col,
-                content_width_points=content_width_points
+                content_width_points=content_width_points,
+                content_height_points=content_height_points
             )
             
             # -----------------------------------------------------------------
-            # Unified Paper Catalog: (enum, effective_width_inches, name, orientation)
-            # Sorted by effective width ascending for best-fit selection.
-            # Includes A4 to fill gaps between Letter and Legal/A3.
+            # Step 1: Try CUSTOM paper width (exact fit, zero whitespace)
+            # Then fall back to standard paper catalog if custom fails.
             # -----------------------------------------------------------------
-            paper_catalog = [
-                # Portrait entries (width = short dimension)
-                # Landscape entries (width = long dimension)
-                # Sorted by effective_width ascending
-                (xlPaperA4,       8.27,  "A4",       xlPortrait),   # 8.27 x 11.69
-                (xlPaperLetter,   8.50,  "Letter",   xlPortrait),   # 8.50 x 11.00
-                (xlPaperLegal,    8.50,  "Legal",    xlPortrait),   # 8.50 x 14.00
-                (xlPaperB4,       9.84,  "B4",       xlPortrait),   # 9.84 x 13.90
-                (xlPaperLetter,  11.00,  "Letter",   xlLandscape),  # 11.00 x 8.50
-                (xlPaperTabloid, 11.00,  "Tabloid",  xlPortrait),   # 11.00 x 17.00
-                (xlPaperA3,      11.69,  "A3",       xlPortrait),   # 11.69 x 16.54
-                (xlPaperA4,      11.69,  "A4",       xlLandscape),  # 11.69 x 8.27
-                (xlPaperB4,      13.90,  "B4",       xlLandscape),  # 13.90 x 9.84
-                (xlPaperB3,      13.90,  "B3",       xlPortrait),   # 13.90 x 19.70
-                (xlPaperLegal,   14.00,  "Legal",    xlLandscape),  # 14.00 x 8.50
-                (xlPaperA2,      16.54,  "A2",       xlPortrait),   # 16.54 x 23.39
-                (xlPaperA3,      16.54,  "A3",       xlLandscape),  # 16.54 x 11.69
-                (xlPaperTabloid, 17.00,  "Tabloid",  xlLandscape),  # 17.00 x 11.00
-                (xlPaperLedger,  17.00,  "Ledger",   xlPortrait),   # 17.00 x 11.00
-                (xlPaperC,       17.00,  "Arch C",   xlPortrait),   # 17.00 x 22.00
-                (xlPaperB3,      19.70,  "B3",       xlLandscape),  # 19.70 x 13.90
-                (xlPaperD,       22.00,  "Arch D",   xlPortrait),   # 22.00 x 34.00
-                (xlPaperC,       22.00,  "Arch C",   xlLandscape),  # 22.00 x 17.00
-                (xlPaperA2,      23.39,  "A2",       xlLandscape),  # 23.39 x 16.54
-                (xlPaperD,       34.00,  "Arch D",   xlLandscape),  # 34.00 x 22.00
-                (xlPaperE,       34.00,  "Arch E",   xlPortrait),   # 34.00 x 44.00
-                (xlPaperE,       44.00,  "Arch E",   xlLandscape),  # 44.00 x 34.00
-            ]
             
-            # Filter catalog by user-configured orientation
+            # Calculate exact paper dimensions including margins
+            margin_inches = 0.5  # Left + Right margin = 0.5" each
+            custom_paper_width = page_width + margin_inches  # content + buffer + right margin
+            custom_paper_height = page_height  # Default 11"
+            
+            # Determine orientation
             orientation_setting = excel_settings.orientation.lower()
             if orientation_setting == "landscape":
-                filtered_catalog = [
-                    entry for entry in paper_catalog if entry[3] == xlLandscape
-                ]
+                target_orientation = xlLandscape
             elif orientation_setting == "portrait":
-                filtered_catalog = [
-                    entry for entry in paper_catalog if entry[3] == xlPortrait
-                ]
+                target_orientation = xlPortrait
             else:
-                # "auto" - consider all orientations for minimum waste
-                filtered_catalog = list(paper_catalog)
+                # Auto: landscape if content is wider than tall
+                target_orientation = xlLandscape if page_width > 8.5 else xlPortrait
             
+            # For landscape, swap width/height so width > height
+            if target_orientation == xlLandscape:
+                if custom_paper_width < custom_paper_height:
+                    custom_paper_width, custom_paper_height = custom_paper_height, custom_paper_width
+            else:
+                # Portrait: height should be >= width
+                if custom_paper_height < custom_paper_width:
+                    custom_paper_height = custom_paper_width + 3.0  # Ensure enough height
+            
+            # Convert to points for COM
+            custom_width_pts = custom_paper_width * self.POINTS_PER_INCH
+            custom_height_pts = custom_paper_height * self.POINTS_PER_INCH
+            
+            custom_paper_success = False
+            
+            # Try setting custom paper dimensions
+            try:
+                orient_set = self._safe_set_page_property(
+                    page_setup, 'Orientation', target_orientation
+                )
+                if orient_set:
+                    # Try PaperWidth/PaperHeight (supported by many virtual PDF printers)
+                    width_set = self._safe_set_page_property(
+                        page_setup, 'PaperWidth', custom_width_pts
+                    )
+                    height_set = self._safe_set_page_property(
+                        page_setup, 'PaperHeight', custom_height_pts
+                    )
+                    
+                    if width_set and height_set:
+                        custom_paper_success = True
+                        orient_label = "Landscape" if target_orientation == xlLandscape else "Portrait"
+                        logger.info(
+                            f"Sheet '{sheet.Name}': Custom paper {orient_label} "
+                            f"{custom_paper_width:.2f}\" x {custom_paper_height:.2f}\" "
+                            f"(exact fit for content width {page_width:.2f}\")"
+                        )
+            except Exception as e:
+                logger.debug(f"Custom paper size failed: {e}")
+            
+            # -----------------------------------------------------------------
+            # Step 2: Fall back to STANDARD paper catalog if custom failed
+            # -----------------------------------------------------------------
             selected_paper = None
             selected_name = None
-            selected_orientation = None
-            limit_width = 8.5
+            selected_orientation = target_orientation
+            limit_width = custom_paper_width if custom_paper_success else 8.5
             oversized = False
-            paper_set_success = False
+            paper_set_success = custom_paper_success
             
-            # 1. Find candidates: all entries that fit, sorted by width (smallest first)
-            candidates = [
-                entry for entry in filtered_catalog if entry[1] >= page_width
-            ]
-            
-            if not candidates:
-                # Content exceeds all paper sizes in the filtered catalog
-                candidates = [filtered_catalog[-1]] if filtered_catalog else [paper_catalog[-1]]
-                oversized = True
-            
-            # 2. Try to set paper size + orientation (smallest fit first)
-            PAPER_SIZE_TIMEOUT = 3
-            for (enum_to_try, limit_to_try, name_to_try, orient_to_try) in candidates:
-                # Set orientation first
-                orient_set = self._safe_set_page_property(page_setup, 'Orientation', orient_to_try)
-                if not orient_set:
-                    continue
-                
-                # Try the paper size
-                success = self._try_set_paper_size(page_setup, enum_to_try, name_to_try, PAPER_SIZE_TIMEOUT)
-                if success:
-                    selected_paper = enum_to_try
-                    selected_name = name_to_try
-                    selected_orientation = orient_to_try
-                    limit_width = limit_to_try
-                    orient_label = "Landscape" if orient_to_try == xlLandscape else "Portrait"
-                    waste = limit_to_try - page_width
-                    logger.info(
-                        f"Sheet '{sheet.Name}': Selected {orient_label} {selected_name} "
-                        f"({limit_width:.2f}\") for content width {page_width:.2f}\" "
-                        f"(waste: {waste:.2f}\")"
-                    )
-                    paper_set_success = True
-                    break
-            
-            if not paper_set_success:
-                logger.warning(
-                    f"Could not set any appropriate paper size for width {page_width:.2f}\". "
-                    f"Printer may lack support for large sizes."
+            if not custom_paper_success:
+                logger.debug(
+                    f"Custom paper not supported, falling back to standard paper catalog"
                 )
-                # Fallback: try all sizes from largest to smallest
-                fallback_sizes = list(reversed(filtered_catalog or paper_catalog))
-                for (fb_enum, fb_width, fb_name, fb_orient) in fallback_sizes:
-                    self._safe_set_page_property(page_setup, 'Orientation', fb_orient)
-                    success = self._try_set_paper_size(page_setup, fb_enum, fb_name, PAPER_SIZE_TIMEOUT)
-                    if success:
-                        selected_paper = fb_enum
-                        selected_name = fb_name
-                        selected_orientation = fb_orient
-                        limit_width = fb_width
-                        paper_set_success = True
+                
+                # Unified Paper Catalog: (enum, effective_width_inches, name, orientation)
+                # Sorted by effective width ascending for best-fit selection.
+                paper_catalog = [
+                    (xlPaperA4,       8.27,  "A4",       xlPortrait),   # 8.27 x 11.69
+                    (xlPaperLetter,   8.50,  "Letter",   xlPortrait),   # 8.50 x 11.00
+                    (xlPaperLegal,    8.50,  "Legal",    xlPortrait),   # 8.50 x 14.00
+                    (xlPaperB4,       9.84,  "B4",       xlPortrait),   # 9.84 x 13.90
+                    (xlPaperLetter,  11.00,  "Letter",   xlLandscape),  # 11.00 x 8.50
+                    (xlPaperTabloid, 11.00,  "Tabloid",  xlPortrait),   # 11.00 x 17.00
+                    (xlPaperA3,      11.69,  "A3",       xlPortrait),   # 11.69 x 16.54
+                    (xlPaperA4,      11.69,  "A4",       xlLandscape),  # 11.69 x 8.27
+                    (xlPaperB4,      13.90,  "B4",       xlLandscape),  # 13.90 x 9.84
+                    (xlPaperB3,      13.90,  "B3",       xlPortrait),   # 13.90 x 19.70
+                    (xlPaperLegal,   14.00,  "Legal",    xlLandscape),  # 14.00 x 8.50
+                    (xlPaperA2,      16.54,  "A2",       xlPortrait),   # 16.54 x 23.39
+                    (xlPaperA3,      16.54,  "A3",       xlLandscape),  # 16.54 x 11.69
+                    (xlPaperTabloid, 17.00,  "Tabloid",  xlLandscape),  # 17.00 x 11.00
+                    (xlPaperLedger,  17.00,  "Ledger",   xlPortrait),   # 17.00 x 11.00
+                    (xlPaperC,       17.00,  "Arch C",   xlPortrait),   # 17.00 x 22.00
+                    (xlPaperB3,      19.70,  "B3",       xlLandscape),  # 19.70 x 13.90
+                    (xlPaperD,       22.00,  "Arch D",   xlPortrait),   # 22.00 x 34.00
+                    (xlPaperC,       22.00,  "Arch C",   xlLandscape),  # 22.00 x 17.00
+                    (xlPaperA2,      23.39,  "A2",       xlLandscape),  # 23.39 x 16.54
+                    (xlPaperD,       34.00,  "Arch D",   xlLandscape),  # 34.00 x 22.00
+                    (xlPaperE,       34.00,  "Arch E",   xlPortrait),   # 34.00 x 44.00
+                    (xlPaperE,       44.00,  "Arch E",   xlLandscape),  # 44.00 x 34.00
+                ]
+                
+                # Filter catalog by orientation
+                if orientation_setting == "landscape":
+                    filtered_catalog = [
+                        entry for entry in paper_catalog if entry[3] == xlLandscape
+                    ]
+                elif orientation_setting == "portrait":
+                    filtered_catalog = [
+                        entry for entry in paper_catalog if entry[3] == xlPortrait
+                    ]
+                else:
+                    filtered_catalog = list(paper_catalog)
+                
+                # Find candidates using shrink threshold
+                # Papers that fit exactly (width >= page_width)
+                threshold = excel_settings.page_shrink_threshold
+                exact_candidates = [
+                    entry for entry in filtered_catalog if entry[1] >= page_width
+                ]
+                
+                # Papers within shrink threshold (slightly smaller than content)
+                # e.g., threshold=0.10: paper 34" is acceptable for content 35.46"
+                # because 35.46/34 = 1.043 (4.3% over, within 10%)
+                shrink_candidates = []
+                if threshold > 0:
+                    min_acceptable_width = page_width / (1 + threshold)
+                    shrink_candidates = [
+                        entry for entry in filtered_catalog
+                        if entry[1] < page_width and entry[1] >= min_acceptable_width
+                    ]
+                
+                # Decide: prefer largest shrink candidate over smallest exact candidate
+                # when the shrink saves significant waste
+                candidates = []
+                if shrink_candidates and exact_candidates:
+                    best_shrink = shrink_candidates[-1]  # Largest paper within shrink range
+                    best_exact = exact_candidates[0]     # Smallest paper that fits exactly
+                    
+                    exact_waste = best_exact[1] - page_width
+                    shrink_amount = page_width - best_shrink[1]
+                    shrink_pct = shrink_amount / best_shrink[1]
+                    
+                    # Use shrink if it wastes less than exact fit
+                    if exact_waste > shrink_amount:
+                        candidates = [best_shrink] + exact_candidates
                         logger.info(
-                            f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - "
-                            f"largest size supported by printer. Content will be scaled to fit."
+                            f"Sheet '{sheet.Name}': Shrink candidate {best_shrink[2]} "
+                            f"({best_shrink[1]:.2f}\") saves {exact_waste - shrink_amount:.2f}\" "
+                            f"vs exact {best_exact[2]} ({best_exact[1]:.2f}\") "
+                            f"(shrink {shrink_pct:.1%})"
                         )
+                    else:
+                        candidates = exact_candidates
+                elif shrink_candidates:
+                    # No exact fit, use largest shrink candidate
+                    candidates = [shrink_candidates[-1]]
+                elif exact_candidates:
+                    candidates = exact_candidates
+                else:
+                    # Content exceeds all paper sizes
+                    candidates = [filtered_catalog[-1]] if filtered_catalog else [paper_catalog[-1]]
+                    oversized = True
+                
+                # Try to set paper size + orientation (best candidate first)
+                PAPER_SIZE_TIMEOUT = 3
+                for (enum_to_try, limit_to_try, name_to_try, orient_to_try) in candidates:
+                    orient_set = self._safe_set_page_property(
+                        page_setup, 'Orientation', orient_to_try
+                    )
+                    if not orient_set:
+                        continue
+                    
+                    success = self._try_set_paper_size(
+                        page_setup, enum_to_try, name_to_try, PAPER_SIZE_TIMEOUT
+                    )
+                    if success:
+                        selected_paper = enum_to_try
+                        selected_name = name_to_try
+                        selected_orientation = orient_to_try
+                        limit_width = limit_to_try
+                        orient_label = "Landscape" if orient_to_try == xlLandscape else "Portrait"
+                        if limit_to_try >= page_width:
+                            waste = limit_to_try - page_width
+                            logger.info(
+                                f"Sheet '{sheet.Name}': Selected {orient_label} {selected_name} "
+                                f"({limit_width:.2f}\") for content width {page_width:.2f}\" "
+                                f"(waste: {waste:.2f}\")"
+                            )
+                        else:
+                            shrink_pct = (page_width - limit_to_try) / limit_to_try
+                            logger.info(
+                                f"Sheet '{sheet.Name}': Selected {orient_label} {selected_name} "
+                                f"({limit_width:.2f}\") for content width {page_width:.2f}\" "
+                                f"(shrink-to-fit: {shrink_pct:.1%})"
+                            )
+                        paper_set_success = True
                         break
                 
                 if not paper_set_success:
-                    logger.warning("Could not set any paper size. Using printer default.")
+                    logger.warning(
+                        f"Could not set any appropriate paper size for width {page_width:.2f}\". "
+                        f"Printer may lack support for large sizes."
+                    )
+                    fallback_sizes = list(reversed(filtered_catalog or paper_catalog))
+                    for (fb_enum, fb_width, fb_name, fb_orient) in fallback_sizes:
+                        self._safe_set_page_property(page_setup, 'Orientation', fb_orient)
+                        success = self._try_set_paper_size(
+                            page_setup, fb_enum, fb_name, PAPER_SIZE_TIMEOUT
+                        )
+                        if success:
+                            selected_paper = fb_enum
+                            selected_name = fb_name
+                            selected_orientation = fb_orient
+                            limit_width = fb_width
+                            paper_set_success = True
+                            logger.info(
+                                f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - "
+                                f"largest size supported by printer."
+                            )
+                            break
+                    
+                    if not paper_set_success:
+                        logger.warning("Could not set any paper size. Using printer default.")
 
             # 3. Oversized validation
             if oversized:

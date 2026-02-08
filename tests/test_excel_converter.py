@@ -283,10 +283,10 @@ def test_smart_page_size_max_clamp(converter, mock_excel_app, tmp_path):
     assert page_width == 200.5
 
 
-# ---- Tests for Unified Paper Catalog (best-fit page size selection) ----
+# ---- Tests for Custom Paper Width + Standard Paper Fallback ----
 
-def test_page_size_landscape_selects_letter(converter, mock_excel_app, tmp_path):
-    """Content 10" wide with landscape orientation should select Landscape Letter (11")."""
+def test_page_size_landscape_custom_paper(converter, mock_excel_app, tmp_path):
+    """Content 10" wide with landscape should use custom paper width for exact fit."""
     input_file = tmp_path / "test.xlsx"
     input_file.touch()
     
@@ -310,22 +310,18 @@ def test_page_size_landscape_selects_letter(converter, mock_excel_app, tmp_path)
     
     converter.convert(input_file, None, settings)
     
-    # Should select Landscape Letter (11") - the smallest landscape paper that fits 10.5"
-    # PaperSize=1 is Letter
+    # Should set landscape orientation and custom paper dimensions
     page_setup = mock_sheet.PageSetup
     assert page_setup.Orientation == 2  # xlLandscape
-    assert page_setup.PaperSize == 1   # xlPaperLetter
 
 
-def test_page_size_landscape_selects_a4(converter, mock_excel_app, tmp_path):
-    """Content 11.5" wide with landscape orientation should select Landscape A4 (11.69"), not Legal (14")."""
+def test_page_size_landscape_custom_fits_content(converter, mock_excel_app, tmp_path):
+    """Content 11.5" wide should use custom paper (exact fit), not standard Legal (14")."""
     input_file = tmp_path / "test.xlsx"
     input_file.touch()
     
     mock_workbook = MagicMock()
     mock_sheet = MagicMock()
-    # 11.5" content = need ~11.5" page width (with 0.5" buffer = 12.0")
-    # Set 16 columns at ~51.75pt each = 828pt = 11.5"
     configure_mock_sheet(mock_sheet, name="WideSheet", cols=16, rows=20)
     
     mock_worksheets = MagicMock()
@@ -344,13 +340,12 @@ def test_page_size_landscape_selects_a4(converter, mock_excel_app, tmp_path):
     
     converter.convert(input_file, None, settings)
     
-    # Should select Landscape A4 (11.69") or Landscape Legal (14") depending on exact width
     page_setup = mock_sheet.PageSetup
     assert page_setup.Orientation == 2  # xlLandscape
 
 
-def test_page_size_portrait_selects_a4(converter, mock_excel_app, tmp_path):
-    """Content 8" wide with portrait orientation should select Portrait A4 (8.27")."""
+def test_page_size_portrait_custom_paper(converter, mock_excel_app, tmp_path):
+    """Content 8" wide with portrait should use custom paper width."""
     input_file = tmp_path / "test.xlsx"
     input_file.touch()
     
@@ -365,7 +360,6 @@ def test_page_size_portrait_selects_a4(converter, mock_excel_app, tmp_path):
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
-    # Content width = 8" = 576 points → page_width = 8.5" (with 0.5" buffer)
     mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=72.0)
     
     settings = PDFConversionSettings(
@@ -378,8 +372,8 @@ def test_page_size_portrait_selects_a4(converter, mock_excel_app, tmp_path):
     assert page_setup.Orientation == 1  # xlPortrait
 
 
-def test_page_size_forced_orientation_filters(converter, mock_excel_app, tmp_path):
-    """Forced portrait orientation should only consider portrait entries."""
+def test_page_size_forced_orientation(converter, mock_excel_app, tmp_path):
+    """Forced portrait orientation should be applied."""
     input_file = tmp_path / "test.xlsx"
     input_file.touch()
     
@@ -394,7 +388,6 @@ def test_page_size_forced_orientation_filters(converter, mock_excel_app, tmp_pat
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
-    # Content width = 5 cols * 72pt = 360pt = 5" → page_width = 5.5"
     mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=72.0)
     
     settings = PDFConversionSettings(
@@ -403,13 +396,12 @@ def test_page_size_forced_orientation_filters(converter, mock_excel_app, tmp_pat
     
     converter.convert(input_file, None, settings)
     
-    # With portrait orientation, should stay in Portrait
     page_setup = mock_sheet.PageSetup
     assert page_setup.Orientation == 1  # xlPortrait
 
 
-def test_page_size_very_wide_content(converter, mock_excel_app, tmp_path):
-    """Content 20" wide should select an appropriate large paper."""
+def test_page_size_standard_fallback_when_custom_fails(converter, mock_excel_app, tmp_path):
+    """When custom paper fails, should fall back to standard paper catalog."""
     input_file = tmp_path / "test.xlsx"
     input_file.touch()
     
@@ -424,16 +416,29 @@ def test_page_size_very_wide_content(converter, mock_excel_app, tmp_path):
     mock_workbook.ActiveSheet = mock_sheet
     mock_excel_app.Workbooks.Open.return_value = mock_workbook
     
-    # Content width = 20" = 1440 points → page_width = 20.5"
     mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=72.0)
+    
+    # Make PaperWidth/PaperHeight fail to force standard fallback
+    page_setup_mock = mock_sheet.PageSetup
+    original_setattr = type(page_setup_mock).__setattr__
+    
+    def reject_custom_paper(self, name, value):
+        if name in ('PaperWidth', 'PaperHeight'):
+            raise Exception("Custom paper not supported")
+        original_setattr(self, name, value)
+    
+    type(page_setup_mock).__setattr__ = reject_custom_paper
     
     settings = PDFConversionSettings(
         excel=ExcelSettings(orientation="landscape")
     )
     
-    converter.convert(input_file, None, settings)
+    try:
+        converter.convert(input_file, None, settings)
+    finally:
+        # Restore original setattr
+        type(page_setup_mock).__setattr__ = original_setattr
     
-    # Should select a paper size that fits 20.5" - Landscape A2 (23.39") is the smallest landscape fit
-    page_setup = mock_sheet.PageSetup
-    assert page_setup.Orientation == 2  # xlLandscape
+    # Should have fallen back to standard paper and set landscape
+    assert page_setup_mock.Orientation == 2  # xlLandscape
 

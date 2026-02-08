@@ -846,171 +846,156 @@ class ExcelConverter(Converter):
                 content_width_points=content_width_points
             )
             
-            # Set orientation with timeout protection
-            # If width > 8.5 OR explicitly set to landscape, try landscape.
-            # But normally we auto-detect orientation based on width ratio?
-            # For now, stick to settings or default to portrait if narrow, landscape if wide?
-            # User requirement: "base on current size of sheet choose page size"
+            # -----------------------------------------------------------------
+            # Unified Paper Catalog: (enum, effective_width_inches, name, orientation)
+            # Sorted by effective width ascending for best-fit selection.
+            # Includes A4 to fill gaps between Letter and Legal/A3.
+            # -----------------------------------------------------------------
+            paper_catalog = [
+                # Portrait entries (width = short dimension)
+                # Landscape entries (width = long dimension)
+                # Sorted by effective_width ascending
+                (xlPaperA4,       8.27,  "A4",       xlPortrait),   # 8.27 x 11.69
+                (xlPaperLetter,   8.50,  "Letter",   xlPortrait),   # 8.50 x 11.00
+                (xlPaperLegal,    8.50,  "Legal",    xlPortrait),   # 8.50 x 14.00
+                (xlPaperB4,       9.84,  "B4",       xlPortrait),   # 9.84 x 13.90
+                (xlPaperLetter,  11.00,  "Letter",   xlLandscape),  # 11.00 x 8.50
+                (xlPaperTabloid, 11.00,  "Tabloid",  xlPortrait),   # 11.00 x 17.00
+                (xlPaperA3,      11.69,  "A3",       xlPortrait),   # 11.69 x 16.54
+                (xlPaperA4,      11.69,  "A4",       xlLandscape),  # 11.69 x 8.27
+                (xlPaperB4,      13.90,  "B4",       xlLandscape),  # 13.90 x 9.84
+                (xlPaperB3,      13.90,  "B3",       xlPortrait),   # 13.90 x 19.70
+                (xlPaperLegal,   14.00,  "Legal",    xlLandscape),  # 14.00 x 8.50
+                (xlPaperA2,      16.54,  "A2",       xlPortrait),   # 16.54 x 23.39
+                (xlPaperA3,      16.54,  "A3",       xlLandscape),  # 16.54 x 11.69
+                (xlPaperTabloid, 17.00,  "Tabloid",  xlLandscape),  # 17.00 x 11.00
+                (xlPaperLedger,  17.00,  "Ledger",   xlPortrait),   # 17.00 x 11.00
+                (xlPaperC,       17.00,  "Arch C",   xlPortrait),   # 17.00 x 22.00
+                (xlPaperB3,      19.70,  "B3",       xlLandscape),  # 19.70 x 13.90
+                (xlPaperD,       22.00,  "Arch D",   xlPortrait),   # 22.00 x 34.00
+                (xlPaperC,       22.00,  "Arch C",   xlLandscape),  # 22.00 x 17.00
+                (xlPaperA2,      23.39,  "A2",       xlLandscape),  # 23.39 x 16.54
+                (xlPaperD,       34.00,  "Arch D",   xlLandscape),  # 34.00 x 22.00
+                (xlPaperE,       34.00,  "Arch E",   xlPortrait),   # 34.00 x 44.00
+                (xlPaperE,       44.00,  "Arch E",   xlLandscape),  # 44.00 x 34.00
+            ]
             
-            # Force orientation based on content?
-            # If content is wider than 8.5 but less than 11, Landscape Letter is better than Portrait Letter?
-            # Let's trust the settings or default to Portrait unless it's very wide.
-            
-            # Determine target orientation
-            target_orientation = xlPortrait  # Default
-            if excel_settings.orientation.lower() == "landscape":
-                target_orientation = xlLandscape
-            elif excel_settings.orientation.lower() == "portrait":
-                target_orientation = xlPortrait
-            else:
-                # Auto orientation based on content width
-                if page_width > 8.5:
-                    target_orientation = xlLandscape
-                else:
-                    target_orientation = xlPortrait
-            
-            # Apply orientation with timeout protection
-            orientation_set = self._safe_set_page_property(page_setup, 'Orientation', target_orientation)
-            if not orientation_set:
-                logger.warning(f"Could not set orientation for sheet '{sheet.Name}', using default")
-
-            # Read back orientation (may differ from target if setting failed)
-            try:
-                is_landscape = (page_setup.Orientation == xlLandscape)
-            except:
-                # Fallback: assume target was applied
-                is_landscape = (target_orientation == xlLandscape)
-            
-            # Define ladder of supported sizes
-            # Format: (Enum, WidthLimit (inches), Name)
-            # WidthLimit: The maximum content width this paper size can effectively hold (considering margins/orientation)
-            
-            # Standard sizes only first? Or mix?
-            # Lets define physically available constraints.
-            
-            if is_landscape:
-                # Width is the longer dimension
-                 paper_ladder = [
-                    (xlPaperLetter, 11.0, "Letter"),        # 11 wide
-                    (xlPaperLegal, 14.0, "Legal"),          # 14 wide
-                    (xlPaperA3, 16.54, "A3"),               # 16.54 wide
-                    (xlPaperTabloid, 17.0, "Tabloid"),      # 17 wide
-                    (xlPaperA2, 23.39, "A2"),               # 23.39 wide
-                    (xlPaperD, 34.0, "Arch D"),             # 34 wide
-                    (xlPaperE, 44.0, "Arch E"),             # 44 wide
+            # Filter catalog by user-configured orientation
+            orientation_setting = excel_settings.orientation.lower()
+            if orientation_setting == "landscape":
+                filtered_catalog = [
+                    entry for entry in paper_catalog if entry[3] == xlLandscape
+                ]
+            elif orientation_setting == "portrait":
+                filtered_catalog = [
+                    entry for entry in paper_catalog if entry[3] == xlPortrait
                 ]
             else:
-                # Width is the shorter dimension
-                paper_ladder = [
-                    (xlPaperLetter, 8.5, "Letter"),         # 8.5 wide
-                    (xlPaperLegal, 8.5, "Legal"),           # 8.5 wide (Legal is just taller)
-                    (xlPaperA3, 11.69, "A3"),               # 11.69 wide
-                    (xlPaperTabloid, 11.0, "Tabloid"),      # 11 wide
-                    (xlPaperA2, 16.54, "A2"),               # 16.54 wide
-                    (xlPaperD, 22.0, "Arch D"),             # 22, wide
-                    (xlPaperE, 34.0, "Arch E"),             # 34 wide
-                ]
-
+                # "auto" - consider all orientations for minimum waste
+                filtered_catalog = list(paper_catalog)
+            
             selected_paper = None
             selected_name = None
+            selected_orientation = None
             limit_width = 8.5
-            oversized = False  # Initialize to prevent UnboundLocalError
-            paper_set_success = False  # Initialize to prevent UnboundLocalError
+            oversized = False
+            paper_set_success = False
             
-            # 1. Find the Smallest Fit and fallback candidates
-            candidates = []
-            best_fit_index = -1
+            # 1. Find candidates: all entries that fit, sorted by width (smallest first)
+            candidates = [
+                entry for entry in filtered_catalog if entry[1] >= page_width
+            ]
             
-            # Find the index of the first size that fits
-            for i, (enum_val, width_limit, name) in enumerate(paper_ladder):
-                if width_limit >= page_width:
-                    best_fit_index = i
-                    break
-            
-            if best_fit_index != -1:
-                # Try all sizes from best fit upwards
-                candidates = paper_ladder[best_fit_index:]
-            else:
-                # Content exceeds all standard sizes, try the largest one
-                candidates = [paper_ladder[-1]]
+            if not candidates:
+                # Content exceeds all paper sizes in the filtered catalog
+                candidates = [filtered_catalog[-1]] if filtered_catalog else [paper_catalog[-1]]
                 oversized = True
             
-            # 2. Try to set valid paper size with timeout protection
-            PAPER_SIZE_TIMEOUT = 3  # seconds per paper size attempt
-            for (enum_to_try, limit_to_try, name_to_try) in candidates:
+            # 2. Try to set paper size + orientation (smallest fit first)
+            PAPER_SIZE_TIMEOUT = 3
+            for (enum_to_try, limit_to_try, name_to_try, orient_to_try) in candidates:
+                # Set orientation first
+                orient_set = self._safe_set_page_property(page_setup, 'Orientation', orient_to_try)
+                if not orient_set:
+                    continue
+                
+                # Try the paper size
                 success = self._try_set_paper_size(page_setup, enum_to_try, name_to_try, PAPER_SIZE_TIMEOUT)
                 if success:
                     selected_paper = enum_to_try
                     selected_name = name_to_try
+                    selected_orientation = orient_to_try
                     limit_width = limit_to_try
-                    logger.info(f"Sheet '{sheet.Name}': Selected paper size '{selected_name}' (Limit {limit_width:.2f}\") to fit estimated content width: {page_width:.2f}\"")
+                    orient_label = "Landscape" if orient_to_try == xlLandscape else "Portrait"
+                    waste = limit_to_try - page_width
+                    logger.info(
+                        f"Sheet '{sheet.Name}': Selected {orient_label} {selected_name} "
+                        f"({limit_width:.2f}\") for content width {page_width:.2f}\" "
+                        f"(waste: {waste:.2f}\")"
+                    )
                     paper_set_success = True
                     break
             
             if not paper_set_success:
-                logger.warning(f"Could not set any appropriate paper size for width {page_width:.2f}\". Printer may lack support for large sizes.")
-                # Fallback: Try all paper sizes from largest to smallest to find the biggest the printer supports
-                fallback_sizes = list(reversed(paper_ladder))  # Try from largest to smallest
-                for (fb_enum, fb_width, fb_name) in fallback_sizes:
+                logger.warning(
+                    f"Could not set any appropriate paper size for width {page_width:.2f}\". "
+                    f"Printer may lack support for large sizes."
+                )
+                # Fallback: try all sizes from largest to smallest
+                fallback_sizes = list(reversed(filtered_catalog or paper_catalog))
+                for (fb_enum, fb_width, fb_name, fb_orient) in fallback_sizes:
+                    self._safe_set_page_property(page_setup, 'Orientation', fb_orient)
                     success = self._try_set_paper_size(page_setup, fb_enum, fb_name, PAPER_SIZE_TIMEOUT)
                     if success:
                         selected_paper = fb_enum
                         selected_name = fb_name
+                        selected_orientation = fb_orient
                         limit_width = fb_width
                         paper_set_success = True
-                        logger.info(f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - largest size supported by printer. Content will be scaled to fit.")
+                        logger.info(
+                            f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - "
+                            f"largest size supported by printer. Content will be scaled to fit."
+                        )
                         break
                 
                 if not paper_set_success:
                     logger.warning("Could not set any paper size. Using printer default.")
 
-            # 3. Validation and Error (The "Make this file error" requirement)
-            # If still oversized despite using largest paper, OR if we failed to set it and standard one is too small.
+            # 3. Oversized validation
+            if oversized:
+                effective_catalog = filtered_catalog or paper_catalog
+                effective_limit_width = limit_width if paper_set_success else effective_catalog[-1][1]
+                effective_limit_name = selected_name if paper_set_success else effective_catalog[-1][2]
             
-            # Re-read what we actually have
-            # current_paper_width? Not easily accessible directly without a map.
-            # We assume best effort was made.
-            
-            if oversized and not paper_set_success:
-                 # Check threshold against the largest size we *tried* to set (Arch E)
-                 limit_to_try = paper_ladder[-1][1]
-                 name_to_try = paper_ladder[-1][2]
-                 
-                 shrink_factor = limit_to_try / page_width
-                 if shrink_factor < excel_settings.min_shrink_factor:
-                     err_msg = (
-                        f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for the largest supported paper '{name_to_try}' ({limit_to_try:.2f}\"). "
+                try:
+                    app = sheet.Application
+                    printer_max_width = self._get_active_printer_max_width_inches(app)
+                    if printer_max_width and printer_max_width > effective_limit_width:
+                        effective_limit_width = printer_max_width
+                        effective_limit_name = "active printer max form"
+                except Exception:
+                    pass
+                
+                shrink_factor = effective_limit_width / page_width
+                if shrink_factor < excel_settings.min_shrink_factor:
+                    err_msg = (
+                        f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for "
+                        f"'{effective_limit_name}' ({effective_limit_width:.2f}\"). "
                         f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold."
-                     )
-                     # Check oversized_action config
-                     if excel_settings.oversized_action == "skip":
-                         logger.warning(f"{err_msg} Skipping sheet.")
-                         raise OversizedSheetError(err_msg)
-                     elif excel_settings.oversized_action == "warn":
-                         logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
-                     else:  # "error" (default)
-                         logger.error(err_msg)
-                         raise ValueError(err_msg)
-                 else:
-                     logger.warning(f"Sheet '{sheet.Name}': Content slightly larger than {name_to_try}. Shrinking to fit (Factor: {shrink_factor:.2f})")
-            elif paper_set_success and oversized:
-                 # We successfully set the largest size, but content is still bigger than it
-                 # Check threshold
-                 shrink_factor = limit_width / page_width
-                 if shrink_factor < excel_settings.min_shrink_factor:
-                     err_msg = (
-                        f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for selected paper '{selected_name}' ({limit_width:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold."
-                     )
-                     # Check oversized_action config
-                     if excel_settings.oversized_action == "skip":
-                         logger.warning(f"{err_msg} Skipping sheet.")
-                         raise OversizedSheetError(err_msg)
-                     elif excel_settings.oversized_action == "warn":
-                         logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
-                     else:  # "error" (default)
-                         logger.error(err_msg)
-                         raise ValueError(err_msg)
+                    )
+                    if excel_settings.oversized_action == "skip":
+                        logger.warning(f"{err_msg} Skipping sheet.")
+                        raise OversizedSheetError(err_msg)
+                    elif excel_settings.oversized_action == "warn":
+                        logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
+                    else:
+                        logger.error(err_msg)
+                        raise ValueError(err_msg)
+                else:
+                    logger.warning(
+                        f"Sheet '{sheet.Name}': Content slightly larger than largest paper. "
+                        f"Shrinking to fit (Factor: {shrink_factor:.2f})"
+                    )
 
             # 4. Final Setup - Apply remaining page setup properties with timeout protection
             # These can also hang on unresponsive printer drivers
@@ -1787,3 +1772,43 @@ class ExcelConverter(Converter):
         return max_width, max_height, last_row, last_col
 
 
+# Add near other helpers, before _apply_page_setup
+def _get_active_printer_max_width_inches(self, app) -> Optional[float]:
+    try:
+        active_printer = str(app.ActivePrinter or "")
+    except Exception:
+        return None
+
+    printer_name = active_printer.split(" on ")[0].strip()
+    if not printer_name:
+        return None
+
+    handle = None
+    try:
+        handle = win32print.OpenPrinter(printer_name)
+        forms = win32print.EnumForms(handle)
+    except Exception:
+        return None
+    finally:
+        if handle:
+            try:
+                win32print.ClosePrinter(handle)
+            except Exception:
+                pass
+
+    max_width_inches = None
+    for form in forms or []:
+        size = form.get("Size")  # thousandths of mm
+        if not size or len(size) != 2:
+            continue
+        try:
+            width_inches = (max(size[0], size[1]) / 1000.0) / 25.4
+        except Exception:
+            continue
+        if width_inches > 0 and (max_width_inches is None or width_inches > max_width_inches):
+            max_width_inches = width_inches
+
+    if max_width_inches is None:
+        return None
+
+    return min(max_width_inches, self.MAX_PAGE_WIDTH_INCHES)

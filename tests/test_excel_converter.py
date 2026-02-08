@@ -281,3 +281,159 @@ def test_smart_page_size_max_clamp(converter, mock_excel_app, tmp_path):
     mock_sheet = MagicMock()
     page_width, _ = converter._calculate_smart_page_size(mock_sheet, 200, content_width_points=200*72.0)
     assert page_width == 200.5
+
+
+# ---- Tests for Unified Paper Catalog (best-fit page size selection) ----
+
+def test_page_size_landscape_selects_letter(converter, mock_excel_app, tmp_path):
+    """Content 10" wide with landscape orientation should select Landscape Letter (11")."""
+    input_file = tmp_path / "test.xlsx"
+    input_file.touch()
+    
+    mock_workbook = MagicMock()
+    mock_sheet = MagicMock()
+    configure_mock_sheet(mock_sheet, name="Sheet1", cols=10, rows=20)
+    
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
+    mock_workbook.ActiveSheet = mock_sheet
+    mock_excel_app.Workbooks.Open.return_value = mock_workbook
+    
+    # Content width = 10 inches = 720 points
+    mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=72.0)
+    
+    settings = PDFConversionSettings(
+        excel=ExcelSettings(orientation="landscape")
+    )
+    
+    converter.convert(input_file, None, settings)
+    
+    # Should select Landscape Letter (11") - the smallest landscape paper that fits 10.5"
+    # PaperSize=1 is Letter
+    page_setup = mock_sheet.PageSetup
+    assert page_setup.Orientation == 2  # xlLandscape
+    assert page_setup.PaperSize == 1   # xlPaperLetter
+
+
+def test_page_size_landscape_selects_a4(converter, mock_excel_app, tmp_path):
+    """Content 11.5" wide with landscape orientation should select Landscape A4 (11.69"), not Legal (14")."""
+    input_file = tmp_path / "test.xlsx"
+    input_file.touch()
+    
+    mock_workbook = MagicMock()
+    mock_sheet = MagicMock()
+    # 11.5" content = need ~11.5" page width (with 0.5" buffer = 12.0")
+    # Set 16 columns at ~51.75pt each = 828pt = 11.5"
+    configure_mock_sheet(mock_sheet, name="WideSheet", cols=16, rows=20)
+    
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
+    mock_workbook.ActiveSheet = mock_sheet
+    mock_excel_app.Workbooks.Open.return_value = mock_workbook
+    
+    # Content width = 11.5 inches = 828 points → page_width = 12.0"
+    mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=51.75)
+    
+    settings = PDFConversionSettings(
+        excel=ExcelSettings(orientation="landscape")
+    )
+    
+    converter.convert(input_file, None, settings)
+    
+    # Should select Landscape A4 (11.69") or Landscape Legal (14") depending on exact width
+    page_setup = mock_sheet.PageSetup
+    assert page_setup.Orientation == 2  # xlLandscape
+
+
+def test_page_size_portrait_selects_a4(converter, mock_excel_app, tmp_path):
+    """Content 8" wide with portrait orientation should select Portrait A4 (8.27")."""
+    input_file = tmp_path / "test.xlsx"
+    input_file.touch()
+    
+    mock_workbook = MagicMock()
+    mock_sheet = MagicMock()
+    configure_mock_sheet(mock_sheet, name="Sheet1", cols=8, rows=20)
+    
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
+    mock_workbook.ActiveSheet = mock_sheet
+    mock_excel_app.Workbooks.Open.return_value = mock_workbook
+    
+    # Content width = 8" = 576 points → page_width = 8.5" (with 0.5" buffer)
+    mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=72.0)
+    
+    settings = PDFConversionSettings(
+        excel=ExcelSettings(orientation="portrait")
+    )
+    
+    converter.convert(input_file, None, settings)
+    
+    page_setup = mock_sheet.PageSetup
+    assert page_setup.Orientation == 1  # xlPortrait
+
+
+def test_page_size_forced_orientation_filters(converter, mock_excel_app, tmp_path):
+    """Forced portrait orientation should only consider portrait entries."""
+    input_file = tmp_path / "test.xlsx"
+    input_file.touch()
+    
+    mock_workbook = MagicMock()
+    mock_sheet = MagicMock()
+    configure_mock_sheet(mock_sheet, name="Sheet1", cols=5, rows=10)
+    
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
+    mock_workbook.ActiveSheet = mock_sheet
+    mock_excel_app.Workbooks.Open.return_value = mock_workbook
+    
+    # Content width = 5 cols * 72pt = 360pt = 5" → page_width = 5.5"
+    mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=72.0)
+    
+    settings = PDFConversionSettings(
+        excel=ExcelSettings(orientation="portrait")
+    )
+    
+    converter.convert(input_file, None, settings)
+    
+    # With portrait orientation, should stay in Portrait
+    page_setup = mock_sheet.PageSetup
+    assert page_setup.Orientation == 1  # xlPortrait
+
+
+def test_page_size_very_wide_content(converter, mock_excel_app, tmp_path):
+    """Content 20" wide should select an appropriate large paper."""
+    input_file = tmp_path / "test.xlsx"
+    input_file.touch()
+    
+    mock_workbook = MagicMock()
+    mock_sheet = MagicMock()
+    configure_mock_sheet(mock_sheet, name="Sheet1", cols=20, rows=10)
+    
+    mock_worksheets = MagicMock()
+    mock_worksheets.__iter__ = lambda self: iter([mock_sheet])
+    mock_worksheets.__call__ = lambda self, idx: mock_sheet
+    mock_workbook.Worksheets = mock_worksheets
+    mock_workbook.ActiveSheet = mock_sheet
+    mock_excel_app.Workbooks.Open.return_value = mock_workbook
+    
+    # Content width = 20" = 1440 points → page_width = 20.5"
+    mock_sheet.Columns.side_effect = lambda idx: MagicMock(Width=72.0)
+    
+    settings = PDFConversionSettings(
+        excel=ExcelSettings(orientation="landscape")
+    )
+    
+    converter.convert(input_file, None, settings)
+    
+    # Should select a paper size that fits 20.5" - Landscape A2 (23.39") is the smallest landscape fit
+    page_setup = mock_sheet.PageSetup
+    assert page_setup.Orientation == 2  # xlLandscape
+

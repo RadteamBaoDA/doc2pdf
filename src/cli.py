@@ -5,7 +5,7 @@ import shutil
 import threading
 import msvcrt
 import atexit
-from .utils.process_manager import ProcessRegistry, kill_office_processes
+from .utils.process_manager import ProcessRegistry
 from .utils.timeout import run_with_timeout, TimeoutError
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +31,7 @@ from .core.powerpoint_converter import PowerPointConverter
 from .core.excel_converter import ExcelConverter
 from .core.macro_converter import MacroConverter, SUPPORTED_FORMATS
 from .core.pdf_processor import PDFProcessor
+from .core.job_runner import run_excel_job
 from .utils.logger import setup_logger, logger
 from .config import (
     get_logging_config, get_pdf_settings, get_suffix_config, 
@@ -277,6 +278,9 @@ def convert(
     
     Supports Word (.doc, .docx), Excel (.xls, .xlsx), and PowerPoint (.ppt, .pptx).
     """
+    # Resolve a concrete destination even for programmatic invocations that pass
+    # None, so suffix and post-processing rules never operate on a missing path.
+    output_path = output_path or Path("output")
     # Register cleanup on exit
     atexit.register(ProcessRegistry.kill_all)
     
@@ -298,9 +302,6 @@ def convert(
 
     # Log config path
     logger.info(f"Using configuration file: {get_config_path().resolve()}")
-
-    # Kill any existing Office processes before starting
-    kill_office_processes()
 
     files = get_files(input_path)
     
@@ -426,38 +427,48 @@ def convert(
                     converted_pdf = None
                     
                     if file_type == "word":
-                        run_with_timeout(
+                        converted_pdf = run_with_timeout(
                             word_converter.convert,
                             document_timeout,
                             file_path, target_file, settings, base_path=base_path
                         )
-                        converted_pdf = target_file
-                        success_count += 1
-                        if report_writer:
-                            report_writer.write_success(file_path, target_file, file_type)
-                        progress.advance(task_id, advance=1)
                     elif file_type == "powerpoint":
-                        run_with_timeout(
+                        converted_pdf = run_with_timeout(
                             ppt_converter.convert,
                             document_timeout,
                             file_path, target_file, settings, base_path=base_path
                         )
-                        converted_pdf = target_file
-                        success_count += 1
-                        if report_writer:
-                            report_writer.write_success(file_path, target_file, file_type)
-                        progress.advance(task_id, advance=1)
                     elif file_type == "excel":
-                        run_with_timeout(
-                            excel_converter.convert,
-                            document_timeout,
-                            file_path, target_file, settings, on_progress=progress_callback, base_path=base_path
+                        if target_file is None:
+                            target_file = file_path.with_name(
+                                file_path.stem + suffix + ".pdf"
+                            )
+                        trim_this_file = should_trim and (
+                            trim is True or file_type in post_proc_config.trim_whitespace.include
                         )
-                        converted_pdf = target_file
-                        success_count += 1
-                        if report_writer:
-                            report_writer.write_success(file_path, target_file, file_type)
-                        progress.advance(task_id, advance=1)
+                        trim_cfg = post_proc_config.trim_whitespace
+                        trim_options = None
+                        if trim_this_file:
+                            trim_options = {
+                                "margin": trim_margin_value,
+                                "box_mode": trim_cfg.box_mode,
+                                "render_dpi": trim_cfg.render_dpi,
+                                "max_render_pixels": trim_cfg.max_render_pixels,
+                                "background_tolerance": trim_cfg.background_tolerance,
+                                "include_annotations": trim_cfg.include_annotations,
+                                "allow_signature_invalidation": trim_cfg.allow_signature_invalidation,
+                            }
+                        combined_timeout = None
+                        if document_timeout or (trim_this_file and excel_trim_timeout):
+                            combined_timeout = (document_timeout or 0) + (
+                                (excel_trim_timeout or 0) if trim_this_file else 0
+                            )
+                        converted_pdf = run_excel_job(
+                            file_path, target_file, settings,
+                            trim_options=trim_options,
+                            timeout_seconds=combined_timeout,
+                            base_path=base_path,
+                        )
                     elif file_type == "pdf":
                         # Log full path
                         logger.info(f"Input PDF found: {file_path}")
@@ -468,9 +479,6 @@ def convert(
                              shutil.copy2(file_path, target_file)
                              logger.info(f"Copied PDF to: {target_file}")
                              converted_pdf = target_file
-                             success_count += 1
-                             if report_writer:
-                                 report_writer.write_success(file_path, target_file, file_type)
                         else:
                              # Just skip or count as success? 
                              # If we don't copy, we essentially "skipped" processing it, but it was "handled".
@@ -490,31 +498,43 @@ def convert(
                                  # This branch is for when target_file is None (dry run?) or copy succeeded
                                  pass 
 
-                        progress.advance(task_id, advance=1)
                     else:
                         logger.warning(f"Conversion for {file_type} not supported. Skipping {file_path.name}")
                         skipped_count += 1
                         if report_writer:
                             report_writer.write_skipped(file_path, f"File type '{file_type}' not supported")
-                        progress.advance(task_id, advance=1)
                     
-                    if converted_pdf and should_trim and converted_pdf.exists():
+                    if converted_pdf and file_type != "excel" and should_trim and converted_pdf.exists():
                         # Check if file type is included in trim settings
-                        if file_type in post_proc_config.trim_whitespace.include:
+                        if trim is True or file_type in post_proc_config.trim_whitespace.include:
                             try:
                                 # Apply timeout specifically for Excel trimming
                                 trim_timeout = excel_trim_timeout if file_type == "excel" else None
+                                trim_cfg = post_proc_config.trim_whitespace
                                 run_with_timeout(
-                                    pdf_processor.trim_whitespace,
-                                    trim_timeout,
-                                    converted_pdf, margin=trim_margin_value
+                                    pdf_processor.trim_whitespace, trim_timeout,
+                                    converted_pdf, margin=trim_margin_value,
+                                    box_mode=trim_cfg.box_mode,
+                                    render_dpi=trim_cfg.render_dpi,
+                                    max_render_pixels=trim_cfg.max_render_pixels,
+                                    background_tolerance=trim_cfg.background_tolerance,
+                                    include_annotations=trim_cfg.include_annotations,
+                                    allow_signature_invalidation=trim_cfg.allow_signature_invalidation,
                                 )
-                            except TimeoutError as timeout_err:
-                                logger.error(f"Trimming timed out for {converted_pdf.name}: {timeout_err}")
+                            except TimeoutError:
+                                raise
                             except Exception as trim_err:
-                                logger.warning(f"Failed to trim whitespace from {converted_pdf.name}: {trim_err}")
+                                raise RuntimeError(
+                                    f"PDF trimming failed for {converted_pdf.name}: {trim_err}"
+                                ) from trim_err
                         else:
                             logger.debug(f"Skipping trim for {file_type} file: {file_path.name}")
+
+                    if converted_pdf:
+                        success_count += 1
+                        if report_writer:
+                            report_writer.write_success(file_path, converted_pdf, file_type)
+                    progress.advance(task_id, advance=1)
                         
                 except TimeoutError as timeout_err:
                     # Thread-safe counter update

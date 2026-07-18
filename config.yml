@@ -76,6 +76,13 @@ post_processing:
     # Example: ["excel"] or ["word", "excel", "powerpoint"]
     include: ["excel"]
 
+    # Apply tight MediaBox and CropBox. Use "cropbox" for compatibility-only mode.
+    box_mode: "physical"
+    render_dpi: 72
+    max_render_pixels: 20000000
+    background_tolerance: 8
+    include_annotations: true
+
 # ============================================================================
 # PDF FILENAME SUFFIX
 # ============================================================================
@@ -241,16 +248,16 @@ pdf_settings:
       priority: 10
       settings:
         # Page orientation
-        # Options: "portrait" | "landscape"
-        # Recommendation: "landscape" for most spreadsheets
-        orientation: "landscape"
+        # Options: "auto" | "portrait" | "landscape"
+        # "auto" evaluates both orientations and chooses the best quality.
+        orientation: "auto"
 
         # Row pagination control - how to split sheets across pages
         # Values:
-        #   null (or omit): Auto-determine based on content
-        #   0: Fit entire sheet on ONE page (may shrink significantly)
-        #   N (positive integer): Fixed N rows per page
-        # Example: 10 means each page contains 10 rows of data
+        #   null (or omit): Natural vertical pagination (except strict "error" mode)
+        #   0: Try one page first, then paginate if needed to preserve quality
+        #   N (positive integer): Maximum N rows per chunk
+        # Example: 10 means each chunk contains at most 10 rows of data
         row_dimensions: 10
 
         # Print metadata header on each page
@@ -258,12 +265,9 @@ pdf_settings:
         # When true, adds header with: Sheet Name | Row Range | Filename
         metadata_header: true
 
-        # Minimum shrink factor before considering sheet "oversized"
-        # Values: 0.0 to 1.0 (decimal representing percentage)
-        # Example: 0.3 = 30% means content can shrink to 30% of original size
-        # Lower values = more aggressive shrinking allowed
-        # Higher values = less shrinking, may trigger oversized_action sooner
-        min_shrink_factor: 0.3
+        # Minimum effective 2D scale before considering a sheet oversized.
+        # 0.90 preserves text and OCR quality at no less than 90% scale.
+        min_shrink_factor: 0.90
 
         # Insert sheet name as large text label in first row for OCR
         # Values: true | false
@@ -273,26 +277,24 @@ pdf_settings:
 
         # Action when sheet exceeds printable size (shrink factor < min_shrink_factor)
         # Options:
+        #   "paginate": Keep the quality floor and split content across pages
         #   "error": Raise error and FAIL the entire file conversion
         #   "skip": SKIP only the oversized sheet, continue with other sheets
         #   "warn": Log WARNING but try to print anyway (content may be unreadable)
-        oversized_action: "skip"
+        oversized_action: "paginate"
+        print_area_policy: "preserve"
+
+        # Optional repeating print-title ranges in Excel A1 notation.
+        # null preserves any PrintTitleRows/PrintTitleColumns already in the workbook.
+        # Examples: print_title_rows: "$1:$2", print_title_columns: "$A:$B"
+        print_title_rows: null
+        print_title_columns: null
 
         # Insert file path before last row of sheet
         # Values: true | false
         # When true: Inserts new row before last row with absolute file path (centered)
         # Useful for: Traceability - knowing which file a PDF page came from
         is_write_file_path: false
-
-        # Page shrink threshold for paper size selection
-        # Values: 0.0 to 1.0 (decimal representing percentage)
-        # When content slightly exceeds a paper size within this threshold,
-        # the smaller paper is chosen and content is shrunk to fit.
-        # This avoids jumping to a much larger paper and wasting space.
-        # Example: 0.10 = 10% means content 35.46" will choose Arch D (34")
-        #          instead of Arch E (44"), because 35.46/34 = 1.043 (4.3% over, within 10%)
-        # Set to 0 to disable (always use exact-fit or next larger paper)
-        page_shrink_threshold: 0.10
 
     # Example: Summary sheets - fit on one page with file path
     - sheet_name: "*Summary*"
@@ -312,7 +314,7 @@ pdf_settings:
       sheet_name: "*"
       priority: 100
       settings:
-        oversized_action: "skip"
+        oversized_action: "error"
 
   # --------------------------------------------------------------------------
   # POWERPOINT DOCUMENT SETTINGS (.ppt, .pptx)

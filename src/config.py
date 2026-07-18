@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List, Literal
 from dataclasses import dataclass, field, asdict
 import fnmatch
+import warnings
 
 _CONFIG_PATH: Path = Path("config.yml")
 
@@ -25,6 +26,12 @@ class TimeoutSettings:
     """Settings for operation timeouts."""
     document_parsing: Optional[int] = 3600  # seconds (1 hour default)
     excel_trim: Optional[int] = 3600  # seconds (1 hour default)
+
+    def __post_init__(self) -> None:
+        for name in ("document_parsing", "excel_trim"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or value <= 0):
+                raise ValueError(f"timeouts.{name} must be null or > 0")
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TimeoutSettings":
@@ -41,6 +48,27 @@ class TrimWhitespaceSettings:
     enabled: bool = False
     margin: float = 10.0  # Points (1/72 inch) of padding around content
     include: List[str] = field(default_factory=lambda: ["word", "excel", "powerpoint"])
+    box_mode: str = "physical"
+    render_dpi: int = 72
+    max_render_pixels: int = 20_000_000
+    background_tolerance: int = 8
+    include_annotations: bool = True
+    allow_signature_invalidation: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.margin, bool) or self.margin < 0:
+            raise ValueError("trim_whitespace.margin must be >= 0")
+        if self.box_mode not in {"physical", "cropbox"}:
+            raise ValueError("trim_whitespace.box_mode must be physical or cropbox")
+        if not 18 <= self.render_dpi <= 600:
+            raise ValueError("trim_whitespace.render_dpi must be between 18 and 600")
+        if self.max_render_pixels <= 0:
+            raise ValueError("trim_whitespace.max_render_pixels must be > 0")
+        if not 0 <= self.background_tolerance <= 255:
+            raise ValueError("trim_whitespace.background_tolerance must be within 0..255")
+        valid_types = {"word", "excel", "powerpoint", "pdf", "ocr"}
+        if not isinstance(self.include, list) or not set(self.include) <= valid_types:
+            raise ValueError("trim_whitespace.include contains an invalid file type")
 
 
 @dataclass
@@ -84,14 +112,40 @@ class PowerPointSettings:
 class ExcelSettings:
     """Excel-specific PDF conversion settings for OCR-optimized output."""
     sheet_name: Optional[str] = None  # Target specific sheet, None = all visible sheets
-    orientation: str = "landscape"  # portrait, landscape
-    row_dimensions: Optional[int] = None  # Rows per page: None=auto, 0=fit all on one page, N=fixed rows
+    orientation: str = "auto"  # auto, portrait, landscape
+    row_dimensions: Optional[int] = None  # None=auto, 0=try whole sheet, N=max rows per chunk
     metadata_header: bool = True  # Print header: sheet name | row range | filename
-    min_shrink_factor: float = 0.8  # Minimum allowed scaling factor before error (default 0.8 = 80%)
+    min_shrink_factor: float = 0.90  # Minimum effective 2D scale (default 0.90 = 90%)
     ocr_sheet_name_label: bool = False  # Insert sheet name as large text in row 1 for OCR
     is_write_file_path: bool = False  # Insert file path row before last row
-    oversized_action: str = "error"  # Action for oversized sheets: 'error', 'skip', 'warn'
-    page_shrink_threshold: float = 0.10  # Allow shrinking up to 10% to fit on smaller paper
+    oversized_action: str = "paginate"  # paginate, error, skip, or warn
+    print_area_policy: str = "preserve"  # preserve existing areas, or auto-detect
+    print_title_rows: Optional[str] = None  # None preserves the workbook setting
+    print_title_columns: Optional[str] = None  # None preserves the workbook setting
+
+    def __post_init__(self) -> None:
+        if self.orientation not in {"portrait", "landscape", "auto"}:
+            raise ValueError("excel.orientation must be portrait, landscape, or auto")
+        if self.row_dimensions is not None and (
+            isinstance(self.row_dimensions, bool)
+            or not isinstance(self.row_dimensions, int)
+            or self.row_dimensions < 0
+        ):
+            raise ValueError("excel.row_dimensions must be null or an integer >= 0")
+        if (
+            isinstance(self.min_shrink_factor, bool)
+            or not isinstance(self.min_shrink_factor, (int, float))
+            or not 0 < float(self.min_shrink_factor) <= 1
+        ):
+            raise ValueError("excel.min_shrink_factor must be within (0, 1]")
+        if self.oversized_action not in {"paginate", "error", "skip", "warn"}:
+            raise ValueError("excel.oversized_action must be paginate, error, skip, or warn")
+        if self.print_area_policy not in {"preserve", "auto"}:
+            raise ValueError("excel.print_area_policy must be preserve or auto")
+        for name in ("print_title_rows", "print_title_columns"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"excel.{name} must be null or a non-empty A1-style range")
     
 @dataclass
 class SummaryReportSettings:
@@ -167,13 +221,21 @@ class PDFConversionSettings:
         ppt_data = data.get("powerpoint", {})
         
         # Excel settings can be in nested 'excel' key OR at top level
-        excel_data = data.get("excel", {})
+        excel_data = dict(data.get("excel", {}) or {})
         # Also check for top-level excel settings (flat structure)
-        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor", "ocr_sheet_name_label", "is_write_file_path", "oversized_action", "page_shrink_threshold"]
+        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor", "ocr_sheet_name_label", "is_write_file_path", "oversized_action", "page_shrink_threshold", "print_area_policy", "print_title_rows", "print_title_columns"]
         for key in top_level_excel_keys:
             if key in data:
                 # Top-level (flat) settings override nested 'excel' settings
                 excel_data[key] = data[key]
+        if "page_shrink_threshold" in excel_data:
+            warnings.warn(
+                "excel.page_shrink_threshold is deprecated and ignored; remove it "
+                "from the configuration",
+                FutureWarning,
+                stacklevel=2,
+            )
+            excel_data.pop("page_shrink_threshold")
         
         return cls(
             scope=data.get("scope", "all"),
@@ -199,9 +261,10 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
-    except Exception as e:
-        print(f"Warning: Failed to load configuration from {path}: {e}")
-        return {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"Malformed YAML configuration {path}: {e}") from e
+    except OSError as e:
+        raise ValueError(f"Cannot read configuration {path}: {e}") from e
 
 def get_logging_config() -> Dict[str, Any]:
     """
@@ -492,34 +555,8 @@ def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConvers
     
     # Start with base settings dict or empty
     if base_settings:
-        # Convert base_settings to dict for merging
-        from dataclasses import asdict
-        final_settings_dict = {
-            "scope": base_settings.scope,
-            "bookmarks": base_settings.bookmarks,
-            "compliance": base_settings.compliance,
-            "layout": {
-                "orientation": base_settings.layout.orientation,
-                "pages_per_sheet": base_settings.layout.pages_per_sheet,
-                "margins": base_settings.layout.margins,
-            },
-            "metadata": {
-                "include_properties": base_settings.metadata.include_properties,
-                "include_tags": base_settings.metadata.include_tags,
-            },
-            "optimization": {
-                "image_quality": base_settings.optimization.image_quality,
-                "bitmap_text": base_settings.optimization.bitmap_text,
-            },
-        }
-        if base_settings.excel:
-            final_settings_dict["excel"] = {
-                "sheet_name": base_settings.excel.sheet_name,
-                "orientation": base_settings.excel.orientation,
-                "row_dimensions": base_settings.excel.row_dimensions,
-                "metadata_header": base_settings.excel.metadata_header,
-                "min_shrink_factor": base_settings.excel.min_shrink_factor,
-            }
+        # Preserve every current and future dataclass field during sheet overrides.
+        final_settings_dict = asdict(base_settings)
     else:
         final_settings_dict = {}
     

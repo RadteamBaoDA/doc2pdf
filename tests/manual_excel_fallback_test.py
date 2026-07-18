@@ -1,17 +1,17 @@
 import sys
 import os
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock, patch
 
 # Add project root to path
 sys.path.append(os.path.abspath("."))
 
-from src.core.excel_converter import ExcelConverter
+from src.core.excel_converter import ExcelConverter, PaperForm
 from src.config import ExcelSettings
 
 def test_fallback_logic():
     converter = ExcelConverter()
     settings = ExcelSettings()
-    settings.orientation = "auto"
+    settings.orientation = "landscape"
     
     print("\n--- Testing Page Size Fallback Logic ---\n")
 
@@ -23,8 +23,7 @@ def test_fallback_logic():
     
     # Test Scenario: 
     # Content width = 10 inches.
-    # Should fit in "Letter" (11.0 landscape) or "Legal" (14.0 landscape).
-    # We will simulate "Letter" failing, and "Legal" succeeding.
+    # Probe only Letter and Legal. Letter is rejected, so Legal must win.
     
     # 1. Content width setup
     sheet.Range.return_value.Width = 10 * 72 # 10 inches
@@ -56,7 +55,7 @@ def test_fallback_logic():
         def __init__(self):
             self.Orientation = 2 # Landscape
             self._paper_size = 0
-            self.Zoom = False
+            self.Zoom = 100
             self.FitToPagesWide = 1
             self.LeftMargin = 0
             self.RightMargin = 0
@@ -70,7 +69,14 @@ def test_fallback_logic():
             self.CenterFooter = ""
             self.RightFooter = ""
             self.BlackAndWhite = False
-            self.Application = MagicMock()  # Required for validation
+            self.PrintArea = ""
+            self.PrintTitleRows = ""
+            self.PrintTitleColumns = ""
+            self.Application = MagicMock(
+                DisplayAlerts=False,
+                Interactive=False,
+                PrintCommunication=True,
+            )  # Required for validation
 
         @property
         def PaperSize(self):
@@ -85,9 +91,22 @@ def test_fallback_logic():
             self._paper_size = value
 
     sheet.PageSetup = MockPageSetup()
+    sheet.Application = sheet.PageSetup.Application
     
     print("Running _apply_page_setup...")
-    converter._apply_page_setup(sheet, settings, "test.xlsx", 10)
+    forms = (
+        PaperForm(xlPaperLetter, "Letter", 8.5, 11.0),
+        PaperForm(xlPaperLegal, "Legal", 8.5, 14.0),
+    )
+    with patch.object(converter, "_get_printer_paper_forms", return_value=forms):
+        converter._apply_page_setup(
+            sheet,
+            settings,
+            "test.xlsx",
+            10,
+            content_width_points=10 * 72,
+            content_height_points=5 * 72,
+        )
     
     final_size = sheet.PageSetup.PaperSize
     print(f"\nFinal PaperSize: {final_size}")

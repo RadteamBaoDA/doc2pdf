@@ -122,6 +122,34 @@ Command này chỉ đọc `.docm`, `.pptm`, `.xlsm`; các file khác trong thư 
 - `pdf_handling`: cách xử lý PDF đã có trong input.
 - các thiết lập PDF/layout riêng cho Word, Excel và PowerPoint, bao gồm rule theo pattern.
 
+### Đầu ra Excel ưu tiên chất lượng
+
+Quá trình chuyển đổi Excel dùng một instance `DispatchEx` riêng và chỉ xét các
+cặp khổ giấy/hướng giấy được printer chấp nhận rồi đọc lại thành công. Planner
+2D đo cả chiều rộng, chiều cao nội dung, margins và print titles lặp lại. Mặc
+định `orientation: auto` thử cả portrait lẫn landscape; khi cấu hình một hướng
+cụ thể, planner chỉ dùng hướng đó. Layout đáp ứng các trục bắt buộc phải fit ở
+`min_shrink_factor: 0.90` sẽ dùng giá trị số lớn nhất của `PageSetup.Zoom`, tối
+đa 100%, đồng thời tắt cả hai cờ fit-to-pages.
+
+Nếu không có candidate nào đáp ứng các trục bắt buộc ở ngưỡng chất lượng 90%,
+mặc định `oversized_action: paginate` giữ numeric Zoom ở 90% và để Excel phân trang theo
+cả chiều ngang lẫn chiều dọc. Planner chọn layout được printer chấp nhận có số
+trang ước tính ít nhất, sau đó ưu tiên khổ giấy nhỏ hơn. Các chế độ `error`,
+`skip` và `warn` vẫn được giữ để tương thích; `warn` có thể fit thấp hơn ngưỡng
+chất lượng đã cấu hình.
+
+Đặt `row_dimensions` là `null` để phân trang dọc tự nhiên, `0` để thử một vùng
+cao một trang trước khi fallback giữ chất lượng, hoặc số dương để giới hạn số
+hàng nguồn tối đa trong mỗi chunk logic. Một chunk vẫn có thể trải qua nhiều
+trang vật lý thay vì bị co dưới ngưỡng. `print_area_policy: preserve` giữ các
+PrintArea hiện có; `auto` xác định vùng từ ô công thức/giá trị và shape hiển thị.
+`print_title_rows` và `print_title_columns` nhận range A1 như `$1:$2` và `$A:$B`;
+giá trị `null` giữ nguyên thiết lập có sẵn trong workbook.
+
+Riêng `oversized_action: error` luôn yêu cầu vùng được chọn vừa cả chiều rộng
+lẫn chiều cao trên một trang, kể cả khi `row_dimensions` là `null`.
+
 `convert-macros` không dùng các thiết lập PDF trong `config.yml`.
 
 ## Kiểm thử

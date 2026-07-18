@@ -4,4 +4,5 @@ loguru>=0.7.0
 pyyaml>=6.0.0
 pywin32>=306
 pypdf>=3.0.0
-pdfminer.six>=20221105
+pypdfium2>=5.0.0
+Pillow>=10.4.0

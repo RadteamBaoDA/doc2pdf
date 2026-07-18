@@ -7,13 +7,14 @@ Features:
 - Configurable row dimensions for vertical pagination
 - Metadata headers (sheet name, row range, filename)
 """
-import sys
+import math
 import time
 from pathlib import Path
-from typing import Optional, List, Tuple, Literal, Callable
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import win32com.client
 import win32print
 import pythoncom
+import win32process
 import dataclasses
 from contextlib import contextmanager
 
@@ -31,33 +32,30 @@ xlPortrait = 1
 xlPaperLetter = 1
 xlPaperA4 = 9
 xlPaperA3 = 8
-xlPaperA2 = 66  # 16.5x23.4 in
+xlPaperA2 = 66  # Driver-specific; used only after the active printer advertises A2
 xlPaperTabloid = 3  # 11x17 in
 xlPaperLegal = 5  # 8.5x14 in
 xlPaperLedger = 4  # 17x11 in (Tabloid rotated)
 xlPaperB4 = 12  # 9.84x13.9 in (JIS B4)
-xlPaperB3 = 13  # 13.9x19.7 in (JIS B3)
 # Architecture sizes
 xlPaperC = 24  # 17x22 in (Arch C)
 xlPaperD = 25  # 22x34 in (Arch D)
 xlPaperE = 26  # 34x44 in (Arch E)
-
-# Page Setup constants
-xlFitToPage = 2
-xlPrintNoComments = -4142
 
 # Worksheet visibility
 xlSheetVisible = -1
 
 # AutomationSecurity constants (msoAutomationSecurity)
 msoAutomationSecurityForceDisable = 3
-msoAutomationSecurityByUI = 2
-msoAutomationSecurityLow = 1
 
 # CorruptLoad constants - for opening potentially corrupted files
 xlNormalLoad = 0
-xlRepairFile = 1
-xlExtractData = 2
+
+# Win32 DeviceCapabilities constants. Keeping the numeric values local avoids
+# depending on an extra pywin32 module just for these stable Win32 constants.
+DC_PAPERS = 2
+DC_PAPERSIZE = 3
+DC_PAPERNAMES = 16
 
 
 class OversizedSheetError(Exception):
@@ -70,6 +68,66 @@ class COMDisconnectedError(Exception):
     pass
 
 
+@dataclasses.dataclass(frozen=True)
+class SheetRegion:
+    first_row: int
+    first_col: int
+    last_row: int
+    last_col: int
+
+    @property
+    def is_empty(self) -> bool:
+        return self.last_row < self.first_row or self.last_col < self.first_col
+
+
+@dataclasses.dataclass(frozen=True)
+class PaperForm:
+    """A printer paper form with physical dimensions in inches."""
+
+    paper_enum: int
+    name: str
+    width_inches: float
+    height_inches: float
+
+    @property
+    def area(self) -> float:
+        return self.width_inches * self.height_inches
+
+
+@dataclasses.dataclass(frozen=True)
+class LayoutCandidate:
+    """Pure-data quality and pagination metrics for one paper/orientation."""
+
+    form: PaperForm
+    orientation: int
+    usable_width_inches: float
+    usable_height_inches: float
+    margins_points: Tuple[float, float, float, float]
+    width_scale: float
+    height_scale: float
+    effective_scale: float
+    max_zoom: int
+    pages_wide: int
+    pages_tall: int
+    page_count: int
+    limiting_axis: str
+
+
+STANDARD_PAPER_FORMS: Tuple[PaperForm, ...] = (
+    PaperForm(xlPaperLetter, "Letter", 8.5, 11.0),
+    PaperForm(xlPaperLegal, "Legal", 8.5, 14.0),
+    PaperForm(xlPaperA4, "A4", 8.27, 11.69),
+    PaperForm(xlPaperB4, "B4", 9.84, 13.90),
+    PaperForm(xlPaperA3, "A3", 11.69, 16.54),
+    PaperForm(xlPaperTabloid, "Tabloid", 11.0, 17.0),
+    PaperForm(xlPaperLedger, "Ledger", 17.0, 11.0),
+    PaperForm(xlPaperA2, "A2", 16.54, 23.39),
+    PaperForm(xlPaperC, "C", 17.0, 22.0),
+    PaperForm(xlPaperD, "D", 22.0, 34.0),
+    PaperForm(xlPaperE, "E", 34.0, 44.0),
+)
+
+
 class ExcelConverter(Converter):
     """
     Converter for Excel documents (.xlsx, .xls, .xlsm, .xlsb) to PDF.
@@ -78,8 +136,7 @@ class ExcelConverter(Converter):
     are readable by OCR tools like miner U, Deepseek OCR, RAGFlow deepdoc.
     """
     
-    # Maximum paper dimensions in Excel (inches)
-    MAX_PAGE_WIDTH_INCHES = 129.0
+    # Geometry defaults (inches)
     MIN_PAGE_WIDTH_INCHES = 8.5
     DEFAULT_PAGE_HEIGHT_INCHES = 11.0
     POINTS_PER_INCH = 72
@@ -88,6 +145,10 @@ class ExcelConverter(Converter):
     xlByRows = 1
     xlByColumns = 2
     xlPrevious = 2
+
+    def __init__(self, process_recorder: Optional[Callable[[int], None]] = None):
+        self._process_recorder = process_recorder
+        self._paper_forms_cache: Dict[str, Tuple[PaperForm, ...]] = {}
     
     def convert(
         self, 
@@ -119,7 +180,7 @@ class ExcelConverter(Converter):
         # Ensure output directory exists
         out_file.parent.mkdir(parents=True, exist_ok=True)
             
-        # settings is PDFConversionSettings
+        settings = settings or PDFConversionSettings()
         excel_settings = settings.excel or ExcelSettings()
         
         logger.info(f"Converting '{input_file.name}' to PDF...")
@@ -181,9 +242,14 @@ class ExcelConverter(Converter):
                     total_sheets = len(sheets_to_export)
                     sheet_weight = 1.0 / total_sheets if total_sheets > 0 else 0
                     
-                    # Apply page setup and process chunks
+                    # Apply optional workbook mutations before final region measurement.
                     skipped_sheets = []  # Track skipped oversized sheets
+                    expected_page_count = 0
+                    exact_page_count = True
                     for sheet in sheets_to_export:
+                        sheet_output_start = len(final_sheets_to_process)
+                        sheet_expected_page_count = expected_page_count
+                        sheet_exact_page_count = exact_page_count
                         try:
                             # Get sheet-specific settings
                             # Note: Arguments are (sheet_name, base_settings, input_path, base_path)
@@ -196,99 +262,79 @@ class ExcelConverter(Converter):
                             if sheet_excel_settings.ocr_sheet_name_label:
                                 self._insert_sheet_name_label(sheet, sheet.Name)
                             
-                            # Calculate content dimensions based on ORIGINAL layout (do not modify row/column sizes)
-                            # Note: We intentionally skip _enforce_min_col_width and _autofit_columns to preserve original formatting
-                            # Returns (width_pts, height_pts, last_row, last_col) using Cells.Find for accurate bounds
-                            content_width, content_height, last_row, last_col = self._get_content_dimensions_points(sheet)
-                            
-                            # Insert file path row if enabled (before last row)
+                            # Path/label mutations must happen before final measurement.
                             if sheet_excel_settings.is_write_file_path:
+                                auto_regions = self._resolve_sheet_regions(sheet, "auto")
+                                if not auto_regions:
+                                    auto_regions = [SheetRegion(1, 1, 1, 1)]
+                                last_row = max(region.last_row for region in auto_regions)
+                                last_col = max(region.last_col for region in auto_regions)
                                 last_row = self._insert_file_path_row(sheet, input_file, last_row, last_col, base_path)
-                            
-                            last_col_alpha = self._col_num_to_letter(last_col)
 
-                            # Check for Chunking
-                            row_lim = sheet_excel_settings.row_dimensions
-                            if row_lim and row_lim > 0:
-                                # Chunking Mode
-                                # Use true last_row instead of UsedRange
-                                if last_row == 0:
-                                    # Empty sheet
-                                    if on_progress: on_progress(sheet_weight)
-                                    continue
-                                    
-                                chunks = (last_row + row_lim - 1) // row_lim
-                                logger.info(f"Splitting sheet '{sheet.Name}' into {chunks} chunks (Rows: {row_lim})")
-                                
-                                # Weight for each chunk
-                                chunk_weight = sheet_weight / chunks
-                                
-                                for i in range(chunks):
-                                    start_row = i * row_lim + 1
-                                    end_row = min((i + 1) * row_lim, last_row)
-                                    
-                                    # Copy sheet to end
-                                    last_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                    sheet.Copy(None, last_sheet)
-                                    new_sheet = workbook.Sheets(workbook.Sheets.Count)
-                                    
-                                    temp_sheets_to_delete.append(new_sheet)
-                                    
-                                    # Set Print Area explicitly to True content columns
-                                    # Format: A{start}:{LastColAlpha}{end} e.g. "A1:Z50"
-                                    self._safe_set_page_property(new_sheet.PageSetup, 'PrintArea', f"$A${start_row}:${last_col_alpha}${end_row}")
-                                    
-                                    # Create chunk settings
-                                    chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
-                                    chunk_settings.row_dimensions = 0 # Force 1 page tall
-                                    
-                                    self._apply_page_setup(
-                                        new_sheet, 
-                                        chunk_settings, 
-                                        input_file.name, 
-                                        last_col, 
-                                        content_width_points=content_width,
-                                        content_height_points=content_height
-                                    )
-
-                                    if on_progress:
-                                        on_progress(chunk_weight)
-                                    
-                                    if sheet_excel_settings.metadata_header:
-                                        center_text = f"{start_row}-{end_row}"
-                                        self._apply_metadata_header(new_sheet, sheet_excel_settings, input_file.name, center_text, left_text=sheet.Name)
-                                        
-                                    final_sheets_to_process.append(new_sheet)
-                            else:
-                                # Standard Mode
-                                # Skip empty sheets
-                                if last_row == 0 or last_col == 0:
-                                    logger.info(f"Skipping empty sheet: {sheet.Name}")
-                                    skipped_sheets.append(sheet.Name)
-                                    if on_progress:
-                                        on_progress(sheet_weight)
-                                    continue
-                                    
-                                # Set print area to avoid printing 1000 blank pages of formatting
-                                self._safe_set_page_property(sheet.PageSetup, 'PrintArea', f"$A$1:${last_col_alpha}${last_row}")
-                                
-                                self._apply_page_setup(
-                                    sheet, 
-                                    sheet_excel_settings, 
-                                    input_file.name, 
-                                    last_col, 
-                                    content_width_points=content_width,
-                                    content_height_points=content_height
-                                )
-                                if sheet_excel_settings.metadata_header:
-                                    self._apply_metadata_header(sheet, sheet_excel_settings, input_file.name, center_text="")
-                                final_sheets_to_process.append(sheet)
-                                
+                            regions = self._resolve_sheet_regions(
+                                sheet, sheet_excel_settings.print_area_policy
+                            )
+                            if not regions:
+                                skipped_sheets.append(sheet.Name)
                                 if on_progress:
                                     on_progress(sheet_weight)
+                                continue
+                            work_regions = []
+                            for region in regions:
+                                row_limit = sheet_excel_settings.row_dimensions
+                                if row_limit and row_limit > 0:
+                                    for first in range(region.first_row, region.last_row + 1, row_limit):
+                                        work_regions.append(SheetRegion(
+                                            first, region.first_col,
+                                            min(region.last_row, first + row_limit - 1), region.last_col,
+                                        ))
+                                else:
+                                    work_regions.append(region)
+                            weight = sheet_weight / len(work_regions)
+                            for region in work_regions:
+                                new_sheet = self._copy_region_sheet(workbook, sheet, region)
+                                temp_sheets_to_delete.append(new_sheet)
+                                chunk_settings = ExcelSettings(**dataclasses.asdict(sheet_excel_settings))
+                                if sheet_excel_settings.row_dimensions is not None:
+                                    chunk_settings.row_dimensions = 0
+                                    if sheet_excel_settings.oversized_action == "paginate":
+                                        # A fixed row chunk is now a maximum region,
+                                        # not a promise that Excel must shrink it to
+                                        # exactly one physical page.
+                                        exact_page_count = False
+                                    else:
+                                        expected_page_count += 1
+                                elif sheet_excel_settings.oversized_action == "error":
+                                    # Strict error mode promises a one-page-high
+                                    # layout even when row_dimensions is null.
+                                    expected_page_count += 1
+                                else:
+                                    exact_page_count = False
+                                region_range = new_sheet.Range(
+                                    new_sheet.Cells(region.first_row, region.first_col),
+                                    new_sheet.Cells(region.last_row, region.last_col),
+                                )
+                                self._apply_page_setup(
+                                    new_sheet, chunk_settings, input_file.name,
+                                    region.last_col,
+                                    content_width_points=float(region_range.Width),
+                                    content_height_points=float(region_range.Height),
+                                )
+                                if sheet_excel_settings.metadata_header:
+                                    self._apply_metadata_header(
+                                        new_sheet, sheet_excel_settings, input_file.name,
+                                        f"{region.first_row}-{region.last_row}", left_text=sheet.Name,
+                                    )
+                                final_sheets_to_process.append(new_sheet)
+                                if on_progress:
+                                    on_progress(weight)
                         
                         except OversizedSheetError:
-                            # Sheet is too large and configured to skip
+                            # Skip is atomic at sheet level: discard any chunks
+                            # staged before a later chunk proved oversized.
+                            del final_sheets_to_process[sheet_output_start:]
+                            expected_page_count = sheet_expected_page_count
+                            exact_page_count = sheet_exact_page_count
                             skipped_sheets.append(sheet.Name)
                             if on_progress:
                                 on_progress(sheet_weight)
@@ -300,12 +346,35 @@ class ExcelConverter(Converter):
                     
                     # Export to PDF
                     if final_sheets_to_process:
-                        self._export_to_pdf(workbook, final_sheets_to_process, str(out_file), settings)
+                        import os
+                        import tempfile
+                        from pypdf import PdfReader
+                        fd, stage_name = tempfile.mkstemp(
+                            prefix=f".{out_file.name}.", suffix=".stage.pdf", dir=str(out_file.parent)
+                        )
+                        os.close(fd)
+                        stage = Path(stage_name)
+                        try:
+                            stage.unlink(missing_ok=True)
+                            self._export_to_pdf(workbook, final_sheets_to_process, str(stage), settings)
+                            if not stage.is_file() or stage.stat().st_size == 0:
+                                raise ValueError("Excel export did not create a nonempty PDF")
+                            exported = PdfReader(str(stage))
+                            if not exported.pages:
+                                raise ValueError("Excel export created a PDF with no pages")
+                            if exact_page_count and len(exported.pages) != expected_page_count:
+                                raise ValueError(
+                                    f"Excel exported {len(exported.pages)} pages; expected exactly "
+                                    f"{expected_page_count} one-page regions"
+                                )
+                            os.replace(stage, out_file)
+                        finally:
+                            stage.unlink(missing_ok=True)
                         elapsed = time.time() - start_time
                         mins, secs = divmod(int(elapsed), 60)
                         logger.success(f"Successfully converted: {out_file} [{mins:02d}:{secs:02d}]")
                     else:
-                        logger.warning("No content to export.")
+                        raise ValueError("Workbook contains no exportable content")
                     
                 except Exception as e:
                     logger.error(f"Failed to convert {input_file.name}: {e}")
@@ -344,14 +413,18 @@ class ExcelConverter(Converter):
         
         for attempt in range(max_retries + 1):
             try:
-                # Kill any zombie Excel processes before starting (on retry)
                 if attempt > 0:
                     logger.warning(f"Retrying Excel initialization (attempt {attempt + 1}/{max_retries + 1})...")
-                    self._kill_zombie_excel()
                     import time
                     time.sleep(1)  # Give OS time to clean up
                 
-                excel = win32com.client.Dispatch("Excel.Application")
+                excel = win32com.client.DispatchEx("Excel.Application")
+                if self._process_recorder:
+                    try:
+                        _, process_id = win32process.GetWindowThreadProcessId(excel.Hwnd)
+                        self._process_recorder(int(process_id))
+                    except Exception as exc:
+                        logger.warning(f"Could not record isolated Excel process id: {exc}")
                 
                 # Validate connection immediately by accessing a property
                 try:
@@ -412,28 +485,8 @@ class ExcelConverter(Converter):
                 self._safe_quit_excel(excel)
 
     def _kill_zombie_excel(self) -> None:
-        """
-        Kill any zombie Excel processes that may be blocking COM.
-        
-        This is used as a recovery mechanism when Excel COM objects become
-        disconnected (error -2147417848 / RPC_E_DISCONNECTED).
-        """
-        try:
-            import subprocess
-            # Use taskkill to forcefully terminate Excel processes
-            result = subprocess.run(
-                ['taskkill', '/F', '/IM', 'EXCEL.EXE'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                logger.info("Killed zombie Excel processes")
-            else:
-                # No Excel processes found or access denied - that's OK
-                logger.debug(f"taskkill result: {result.stderr.strip()}")
-        except Exception as e:
-            logger.debug(f"Could not kill zombie Excel processes: {e}")
+        """Compatibility no-op; global Excel termination is intentionally disabled."""
+        logger.debug("Global Excel process termination is disabled")
 
     def _safe_quit_excel(self, excel, timeout_seconds: int = 5) -> None:
         """
@@ -612,7 +665,7 @@ class ExcelConverter(Converter):
         content_height_points: Optional[float] = None
     ) -> Tuple[float, float]:
         """
-        Calculate page width and height based on actual content dimensions.
+        Calculate raw content width and height from Excel range geometry.
         
         Args:
             sheet: Excel Worksheet object
@@ -621,7 +674,7 @@ class ExcelConverter(Converter):
             content_height_points: Optional explicit content height in points.
             
         Returns:
-            Tuple of (page_width_inches, page_height_inches)
+            Tuple of (content_width_inches, content_height_inches)
         """
         try:
             if last_col_index < 1 and not content_width_points:
@@ -641,26 +694,19 @@ class ExcelConverter(Converter):
                 content_width_points = col_range.Width
                 content_width_inches = content_width_points / self.POINTS_PER_INCH
             
-            # Add a small buffer for margins (0.5 inch total)
-            page_width = content_width_inches + 0.5
-            
-            # Page height - use actual content height if available
+            # Margins are deliberately not included here. The layout planner
+            # subtracts the margins that Excel actually retains for each form.
             if content_height_points is not None and content_height_points > 0:
                 content_height_inches = content_height_points / self.POINTS_PER_INCH
-                # Add margin buffer: top (0.5-1") + bottom (0.5") + small padding
-                page_height = content_height_inches + 1.5
-                # Ensure minimum page height (at least 3 inches)
-                page_height = max(page_height, 3.0)
             else:
-                page_height = self.DEFAULT_PAGE_HEIGHT_INCHES
+                content_height_inches = self.DEFAULT_PAGE_HEIGHT_INCHES
             
             logger.debug(
                 f"Sheet '{sheet.Name}' (Cols 1-{last_col_index}): "
-                f"Content Width: {content_width_inches:.2f}\" -> Page Width (w/ margins): {page_width:.2f}\" | "
-                f"Page Height: {page_height:.2f}\""
+                f"Content: {content_width_inches:.2f}\" x {content_height_inches:.2f}\""
             )
             
-            return page_width, page_height
+            return content_width_inches, content_height_inches
             
         except Exception as e:
             logger.warning(f"Could not calculate smart page size: {e}")
@@ -805,21 +851,416 @@ class ExcelConverter(Converter):
         if page_setup is None:
             logger.debug(f"Cannot set PageSetup.{prop_name}: PageSetup object is None")
             return False
-        
-        # Quick validation: try to access the object type
         try:
-            # Check if it's a valid COM object by accessing a read-only property
             _ = page_setup.Application
         except Exception:
             logger.debug(f"Cannot set PageSetup.{prop_name}: PageSetup object is invalid")
             return False
-        
         try:
             setattr(page_setup, prop_name, value)
             return True
         except Exception as e:
             logger.debug(f"Failed to set PageSetup.{prop_name}: {e}")
             return False
+
+    def _required_set_page_property(self, page_setup, prop_name: str, value) -> None:
+        """Set, commit and read back a required Excel PageSetup property."""
+        if not self._safe_set_page_property(page_setup, prop_name, value):
+            raise ValueError(f"Excel rejected required PageSetup.{prop_name}={value!r}")
+        try:
+            page_setup.Application.PrintCommunication = True
+            actual = getattr(page_setup, prop_name)
+        except Exception as exc:
+            raise ValueError(f"Cannot verify PageSetup.{prop_name}: {exc}") from exc
+        if not self._page_property_matches(actual, value):
+            raise ValueError(
+                f"Excel did not retain PageSetup.{prop_name}: requested {value!r}, "
+                f"read back {actual!r}"
+            )
+
+    @staticmethod
+    def _page_property_matches(actual, expected) -> bool:
+        """Compare COM readback values, including bool/int and float coercion."""
+        if isinstance(expected, bool):
+            return bool(actual) is expected
+        if (
+            isinstance(expected, (int, float))
+            and not isinstance(expected, bool)
+            and isinstance(actual, (int, float))
+            and not isinstance(actual, bool)
+        ):
+            return math.isclose(float(actual), float(expected), abs_tol=1e-7)
+        return actual == expected
+
+    @staticmethod
+    def _printer_advertises_a2(app) -> bool:
+        try:
+            printer_name = str(app.ActivePrinter or "").rsplit(" on ", 1)[0].strip()
+            handle = win32print.OpenPrinter(printer_name)
+            try:
+                return any("A2" in str(form.get("Name", "")).upper() for form in win32print.EnumForms(handle))
+            finally:
+                win32print.ClosePrinter(handle)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _device_paper_size_inches(size) -> Optional[Tuple[float, float]]:
+        """Convert a DC_PAPERSIZE value (tenths of millimetres) to inches."""
+        try:
+            width, height = size
+            width_inches = float(width) / 254.0
+            height_inches = float(height) / 254.0
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if width_inches <= 0 or height_inches <= 0:
+            return None
+        return width_inches, height_inches
+
+    def _get_printer_paper_forms(self, app) -> Tuple[PaperForm, ...]:
+        """Return known Excel forms using dimensions advertised by the printer."""
+        try:
+            active_printer = str(app.ActivePrinter or "").strip()
+        except Exception:
+            active_printer = ""
+        cache_key = active_printer or "<unknown-printer>"
+        cached = self._paper_forms_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        known = {form.paper_enum: form for form in STANDARD_PAPER_FORMS}
+        advertised: List[PaperForm] = []
+        printer_name = active_printer.rsplit(" on ", 1)[0].strip()
+        handle = None
+        try:
+            if not printer_name:
+                raise ValueError("Excel ActivePrinter is empty")
+            handle = win32print.OpenPrinter(printer_name)
+            printer_info = win32print.GetPrinter(handle, 2)
+            port_name = str(printer_info.get("pPortName", "") or "")
+            paper_ids = win32print.DeviceCapabilities(
+                printer_name, port_name, DC_PAPERS
+            )
+            paper_sizes = win32print.DeviceCapabilities(
+                printer_name, port_name, DC_PAPERSIZE
+            )
+            paper_names = win32print.DeviceCapabilities(
+                printer_name, port_name, DC_PAPERNAMES
+            )
+            for index, paper_id in enumerate(paper_ids or []):
+                try:
+                    paper_enum = int(paper_id)
+                    fallback = known[paper_enum]
+                    dimensions = self._device_paper_size_inches(paper_sizes[index])
+                except (IndexError, KeyError, TypeError, ValueError):
+                    continue
+                if dimensions is None:
+                    continue
+                try:
+                    advertised_name = str(paper_names[index]).strip()
+                except (IndexError, TypeError):
+                    advertised_name = ""
+                advertised.append(PaperForm(
+                    paper_enum=paper_enum,
+                    name=advertised_name or fallback.name,
+                    width_inches=dimensions[0],
+                    height_inches=dimensions[1],
+                ))
+        except Exception as exc:
+            logger.debug(f"Could not enumerate active printer forms: {exc}")
+        finally:
+            if handle is not None:
+                try:
+                    win32print.ClosePrinter(handle)
+                except Exception:
+                    pass
+
+        if advertised:
+            # DeviceCapabilities can contain duplicate IDs. Keep the first
+            # driver-advertised definition so selection remains deterministic.
+            unique: Dict[int, PaperForm] = {}
+            for form in advertised:
+                unique.setdefault(form.paper_enum, form)
+            result = tuple(unique.values())
+        else:
+            result_list = [
+                form for form in STANDARD_PAPER_FORMS
+                if form.paper_enum != xlPaperA2
+            ]
+            if self._printer_advertises_a2(app):
+                result_list.append(known[xlPaperA2])
+            result = tuple(result_list)
+
+        self._paper_forms_cache[cache_key] = result
+        return result
+
+    def _probe_paper_orientation(
+        self,
+        page_setup,
+        form: PaperForm,
+        orientation: int,
+        requested_margins: Tuple[float, float, float, float],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Set a paper/orientation pair and return committed margins in points."""
+        if not self._try_set_paper_size(page_setup, form.paper_enum, form.name):
+            return None
+        if not self._safe_set_page_property(page_setup, "Orientation", orientation):
+            return None
+        for prop_name, value in zip(
+            ("LeftMargin", "RightMargin", "TopMargin", "BottomMargin"),
+            requested_margins,
+        ):
+            if not self._safe_set_page_property(page_setup, prop_name, value):
+                return None
+        try:
+            page_setup.Application.PrintCommunication = True
+            if page_setup.PaperSize != form.paper_enum:
+                return None
+            if page_setup.Orientation != orientation:
+                return None
+            return (
+                float(page_setup.LeftMargin),
+                float(page_setup.RightMargin),
+                float(page_setup.TopMargin),
+                float(page_setup.BottomMargin),
+            )
+        except Exception as exc:
+            logger.debug(
+                f"Printer rejected {form.name}/"
+                f"{'landscape' if orientation == xlLandscape else 'portrait'}: {exc}"
+            )
+            return None
+
+    @staticmethod
+    def _page_span_count(
+        content_inches: float,
+        repeated_title_inches: float,
+        usable_inches: float,
+        zoom: int,
+    ) -> int:
+        """Estimate pages on one axis at a fixed Excel print Zoom."""
+        scaled_capacity = usable_inches / max(zoom / 100.0, 0.01)
+        content_inches = max(content_inches, 0.01)
+        repeated_title_inches = min(
+            max(repeated_title_inches, 0.0), content_inches
+        )
+        if repeated_title_inches > 0 and content_inches > repeated_title_inches:
+            data_capacity = max(0.01, scaled_capacity - repeated_title_inches)
+            data_extent = content_inches - repeated_title_inches
+            return max(1, math.ceil(data_extent / data_capacity))
+        return max(1, math.ceil(content_inches / max(scaled_capacity, 0.01)))
+
+    @staticmethod
+    def _build_layout_candidate(
+        form: PaperForm,
+        orientation: int,
+        content_width_inches: float,
+        content_height_inches: float,
+        fit_tall: bool,
+        margins_points: Tuple[float, float, float, float],
+        quality_zoom: int,
+        title_width_inches: float = 0.0,
+        title_height_inches: float = 0.0,
+    ) -> LayoutCandidate:
+        """Build quality metrics without touching COM, enabling boundary tests."""
+        left, right, top, bottom = margins_points
+        if orientation == xlLandscape:
+            physical_width = form.height_inches
+            physical_height = form.width_inches
+        else:
+            physical_width = form.width_inches
+            physical_height = form.height_inches
+        usable_width = max(
+            0.01, physical_width - ((left + right) / ExcelConverter.POINTS_PER_INCH)
+        )
+        usable_height = max(
+            0.01, physical_height - ((top + bottom) / ExcelConverter.POINTS_PER_INCH)
+        )
+        width_scale = usable_width / max(content_width_inches, 0.01)
+        height_scale = (
+            usable_height / max(content_height_inches, 0.01)
+            if fit_tall else 1.0
+        )
+        effective_scale = min(1.0, width_scale, height_scale)
+        max_zoom = max(
+            1, min(100, int(math.floor((effective_scale * 100.0) + 1e-7)))
+        )
+        pages_wide = ExcelConverter._page_span_count(
+            content_width_inches, title_width_inches,
+            usable_width, quality_zoom,
+        )
+        pages_tall = ExcelConverter._page_span_count(
+            content_height_inches, title_height_inches,
+            usable_height, quality_zoom,
+        )
+        if effective_scale >= 1.0:
+            limiting_axis = "none"
+        elif fit_tall and height_scale <= width_scale:
+            limiting_axis = "height"
+        else:
+            limiting_axis = "width"
+        return LayoutCandidate(
+            form=form,
+            orientation=orientation,
+            usable_width_inches=usable_width,
+            usable_height_inches=usable_height,
+            margins_points=margins_points,
+            width_scale=width_scale,
+            height_scale=height_scale,
+            effective_scale=effective_scale,
+            max_zoom=max_zoom,
+            pages_wide=pages_wide,
+            pages_tall=pages_tall,
+            page_count=pages_wide * pages_tall,
+            limiting_axis=limiting_axis,
+        )
+
+    @staticmethod
+    def _fit_candidate_sort_key(candidate: LayoutCandidate) -> Tuple:
+        return (
+            -candidate.max_zoom,
+            candidate.form.area,
+            candidate.usable_width_inches * candidate.usable_height_inches,
+            candidate.form.paper_enum,
+            candidate.orientation,
+        )
+
+    @staticmethod
+    def _select_fit_candidate(
+        candidates: Sequence[LayoutCandidate], quality_zoom: int
+    ) -> Optional[LayoutCandidate]:
+        eligible = [
+            candidate for candidate in candidates
+            if candidate.max_zoom >= quality_zoom
+        ]
+        return min(eligible, key=ExcelConverter._fit_candidate_sort_key) if eligible else None
+
+    @staticmethod
+    def _select_paginated_candidate(
+        candidates: Sequence[LayoutCandidate],
+    ) -> LayoutCandidate:
+        if not candidates:
+            raise ValueError("No supported layout candidates")
+        return min(candidates, key=lambda candidate: (
+            candidate.page_count,
+            candidate.form.area,
+            candidate.form.paper_enum,
+            candidate.orientation,
+        ))
+
+    @staticmethod
+    def _measure_print_titles(sheet) -> Tuple[float, float, float, float]:
+        """Return title size and any portion outside the active print area."""
+        width_points = 0.0
+        height_points = 0.0
+        extra_width_points = 0.0
+        extra_height_points = 0.0
+        try:
+            columns = str(sheet.PageSetup.PrintTitleColumns or "").strip()
+            rows = str(sheet.PageSetup.PrintTitleRows or "").strip()
+        except Exception as exc:
+            raise ValueError(
+                f"Sheet '{sheet.Name}': cannot read print-title settings: {exc}"
+            ) from exc
+        if not columns and not rows:
+            return 0.0, 0.0, 0.0, 0.0
+
+        try:
+            print_area_text = str(sheet.PageSetup.PrintArea or "").strip()
+            print_area_range = (
+                sheet.Range(print_area_text) if print_area_text else None
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Sheet '{sheet.Name}': cannot resolve PrintArea while "
+                f"measuring print titles: {exc}"
+            ) from exc
+
+        if columns:
+            try:
+                title_range = sheet.Range(columns)
+                width_points = float(title_range.Width)
+                if print_area_range is not None:
+                    overlap = sheet.Application.Intersect(
+                        print_area_range, title_range
+                    )
+                    overlap_width = (
+                        float(overlap.Width) if overlap is not None else 0.0
+                    )
+                    extra_width_points = max(
+                        0.0, width_points - overlap_width
+                    )
+            except Exception as exc:
+                raise ValueError(
+                    f"Sheet '{sheet.Name}': cannot measure "
+                    f"PrintTitleColumns {columns!r}: {exc}"
+                ) from exc
+        if rows:
+            try:
+                title_range = sheet.Range(rows)
+                height_points = float(title_range.Height)
+                if print_area_range is not None:
+                    overlap = sheet.Application.Intersect(
+                        print_area_range, title_range
+                    )
+                    overlap_height = (
+                        float(overlap.Height) if overlap is not None else 0.0
+                    )
+                    extra_height_points = max(
+                        0.0, height_points - overlap_height
+                    )
+            except Exception as exc:
+                raise ValueError(
+                    f"Sheet '{sheet.Name}': cannot measure "
+                    f"PrintTitleRows {rows!r}: {exc}"
+                ) from exc
+        return (
+            width_points / ExcelConverter.POINTS_PER_INCH,
+            height_points / ExcelConverter.POINTS_PER_INCH,
+            extra_width_points / ExcelConverter.POINTS_PER_INCH,
+            extra_height_points / ExcelConverter.POINTS_PER_INCH,
+        )
+
+    def _apply_print_title_override(self, sheet, prop_name: str, value: str) -> None:
+        """Apply a title range while accepting Excel's canonicalized A1 syntax."""
+        page_setup = sheet.PageSetup
+        if not self._safe_set_page_property(page_setup, prop_name, value):
+            raise ValueError(f"Excel rejected required PageSetup.{prop_name}={value!r}")
+        try:
+            page_setup.Application.PrintCommunication = True
+        except Exception as exc:
+            raise ValueError(f"Cannot verify PageSetup.{prop_name}: {exc}") from exc
+        self._verify_print_title_readback(sheet, prop_name, value)
+
+    @staticmethod
+    def _verify_print_title_readback(
+        sheet, prop_name: str, expected: str
+    ) -> None:
+        """Verify a title range, resolving Excel's canonical A1 representation."""
+        try:
+            actual = str(getattr(sheet.PageSetup, prop_name) or "").strip()
+        except Exception as exc:
+            raise ValueError(f"Cannot verify PageSetup.{prop_name}: {exc}") from exc
+        expected = str(expected or "").strip()
+        if actual == expected:
+            return
+        if not actual or not expected:
+            raise ValueError(
+                f"Excel did not retain PageSetup.{prop_name}: requested "
+                f"{expected!r}, read back {actual!r}"
+            )
+        try:
+            expected_address = str(sheet.Range(expected).Address)
+            actual_address = str(sheet.Range(actual).Address)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot resolve PageSetup.{prop_name} readback: {exc}"
+            ) from exc
+        if actual_address != expected_address:
+            raise ValueError(
+                f"Excel did not retain PageSetup.{prop_name}: requested "
+                f"{expected!r}, read back {actual!r}"
+            )
 
     def _apply_page_setup(
         self, 
@@ -841,331 +1282,180 @@ class ExcelConverter(Converter):
             content_width_points: Optional total content width in points
             content_height_points: Optional total content height in points
         """
-        try:
-            page_setup = sheet.PageSetup
-            
-            # Ensure dialogs are suppressed before any PageSetup operations
-            try:
-                app = sheet.Application
-                app.DisplayAlerts = False
-                app.Interactive = False
-                # NOTE: Keep PrintCommunication=True so PageSetup changes are applied
-            except:
-                pass
-            
-            # Calculate smart page size
-            page_width, page_height = self._calculate_smart_page_size(
-                sheet, 
-                last_col,
-                content_width_points=content_width_points,
-                content_height_points=content_height_points
+        page_setup = sheet.PageSetup
+        app = sheet.Application
+        app.DisplayAlerts = False
+        app.Interactive = False
+        if excel_settings.print_title_rows is not None:
+            self._apply_print_title_override(
+                sheet, "PrintTitleRows", excel_settings.print_title_rows
             )
-            
-            # -----------------------------------------------------------------
-            # Step 1: Try CUSTOM paper width (exact fit, zero whitespace)
-            # Then fall back to standard paper catalog if custom fails.
-            # -----------------------------------------------------------------
-            
-            # Calculate exact paper dimensions including margins
-            margin_inches = 0.5  # Left + Right margin = 0.5" each
-            custom_paper_width = page_width + margin_inches  # content + buffer + right margin
-            custom_paper_height = page_height  # Default 11"
-            
-            # Determine orientation
-            orientation_setting = excel_settings.orientation.lower()
-            if orientation_setting == "landscape":
-                target_orientation = xlLandscape
-            elif orientation_setting == "portrait":
-                target_orientation = xlPortrait
-            else:
-                # Auto: landscape if content is wider than tall
-                target_orientation = xlLandscape if page_width > 8.5 else xlPortrait
-            
-            # For landscape, swap width/height so width > height
-            if target_orientation == xlLandscape:
-                if custom_paper_width < custom_paper_height:
-                    custom_paper_width, custom_paper_height = custom_paper_height, custom_paper_width
-            else:
-                # Portrait: height should be >= width
-                if custom_paper_height < custom_paper_width:
-                    custom_paper_height = custom_paper_width + 3.0  # Ensure enough height
-            
-            # Convert to points for COM
-            custom_width_pts = custom_paper_width * self.POINTS_PER_INCH
-            custom_height_pts = custom_paper_height * self.POINTS_PER_INCH
-            
-            custom_paper_success = False
-            
-            # Try setting custom paper dimensions
-            try:
-                orient_set = self._safe_set_page_property(
-                    page_setup, 'Orientation', target_orientation
-                )
-                if orient_set:
-                    # Try PaperWidth/PaperHeight (supported by many virtual PDF printers)
-                    width_set = self._safe_set_page_property(
-                        page_setup, 'PaperWidth', custom_width_pts
-                    )
-                    height_set = self._safe_set_page_property(
-                        page_setup, 'PaperHeight', custom_height_pts
-                    )
-                    
-                    if width_set and height_set:
-                        custom_paper_success = True
-                        orient_label = "Landscape" if target_orientation == xlLandscape else "Portrait"
-                        logger.info(
-                            f"Sheet '{sheet.Name}': Custom paper {orient_label} "
-                            f"{custom_paper_width:.2f}\" x {custom_paper_height:.2f}\" "
-                            f"(exact fit for content width {page_width:.2f}\")"
-                        )
-            except Exception as e:
-                logger.debug(f"Custom paper size failed: {e}")
-            
-            # -----------------------------------------------------------------
-            # Step 2: Fall back to STANDARD paper catalog if custom failed
-            # -----------------------------------------------------------------
-            selected_paper = None
-            selected_name = None
-            selected_orientation = target_orientation
-            limit_width = custom_paper_width if custom_paper_success else 8.5
-            oversized = False
-            paper_set_success = custom_paper_success
-            
-            if not custom_paper_success:
-                logger.debug(
-                    f"Custom paper not supported, falling back to standard paper catalog"
-                )
-                
-                # Unified Paper Catalog: (enum, effective_width_inches, name, orientation)
-                # Sorted by effective width ascending for best-fit selection.
-                paper_catalog = [
-                    (xlPaperA4,       8.27,  "A4",       xlPortrait),   # 8.27 x 11.69
-                    (xlPaperLetter,   8.50,  "Letter",   xlPortrait),   # 8.50 x 11.00
-                    (xlPaperLegal,    8.50,  "Legal",    xlPortrait),   # 8.50 x 14.00
-                    (xlPaperB4,       9.84,  "B4",       xlPortrait),   # 9.84 x 13.90
-                    (xlPaperLetter,  11.00,  "Letter",   xlLandscape),  # 11.00 x 8.50
-                    (xlPaperTabloid, 11.00,  "Tabloid",  xlPortrait),   # 11.00 x 17.00
-                    (xlPaperA3,      11.69,  "A3",       xlPortrait),   # 11.69 x 16.54
-                    (xlPaperA4,      11.69,  "A4",       xlLandscape),  # 11.69 x 8.27
-                    (xlPaperB4,      13.90,  "B4",       xlLandscape),  # 13.90 x 9.84
-                    (xlPaperB3,      13.90,  "B3",       xlPortrait),   # 13.90 x 19.70
-                    (xlPaperLegal,   14.00,  "Legal",    xlLandscape),  # 14.00 x 8.50
-                    (xlPaperA2,      16.54,  "A2",       xlPortrait),   # 16.54 x 23.39
-                    (xlPaperA3,      16.54,  "A3",       xlLandscape),  # 16.54 x 11.69
-                    (xlPaperTabloid, 17.00,  "Tabloid",  xlLandscape),  # 17.00 x 11.00
-                    (xlPaperLedger,  17.00,  "Ledger",   xlPortrait),   # 17.00 x 11.00
-                    (xlPaperC,       17.00,  "Arch C",   xlPortrait),   # 17.00 x 22.00
-                    (xlPaperB3,      19.70,  "B3",       xlLandscape),  # 19.70 x 13.90
-                    (xlPaperD,       22.00,  "Arch D",   xlPortrait),   # 22.00 x 34.00
-                    (xlPaperC,       22.00,  "Arch C",   xlLandscape),  # 22.00 x 17.00
-                    (xlPaperA2,      23.39,  "A2",       xlLandscape),  # 23.39 x 16.54
-                    (xlPaperD,       34.00,  "Arch D",   xlLandscape),  # 34.00 x 22.00
-                    (xlPaperE,       34.00,  "Arch E",   xlPortrait),   # 34.00 x 44.00
-                    (xlPaperE,       44.00,  "Arch E",   xlLandscape),  # 44.00 x 34.00
-                ]
-                
-                # Filter catalog by orientation
-                if orientation_setting == "landscape":
-                    filtered_catalog = [
-                        entry for entry in paper_catalog if entry[3] == xlLandscape
-                    ]
-                elif orientation_setting == "portrait":
-                    filtered_catalog = [
-                        entry for entry in paper_catalog if entry[3] == xlPortrait
-                    ]
-                else:
-                    filtered_catalog = list(paper_catalog)
-                
-                # Find candidates using shrink threshold
-                # Papers that fit exactly (width >= page_width)
-                threshold = excel_settings.page_shrink_threshold
-                exact_candidates = [
-                    entry for entry in filtered_catalog if entry[1] >= page_width
-                ]
-                
-                # Papers within shrink threshold (slightly smaller than content)
-                # e.g., threshold=0.10: paper 34" is acceptable for content 35.46"
-                # because 35.46/34 = 1.043 (4.3% over, within 10%)
-                shrink_candidates = []
-                if threshold > 0:
-                    min_acceptable_width = page_width / (1 + threshold)
-                    shrink_candidates = [
-                        entry for entry in filtered_catalog
-                        if entry[1] < page_width and entry[1] >= min_acceptable_width
-                    ]
-                
-                # Decide: prefer largest shrink candidate over smallest exact candidate
-                # when the shrink saves significant waste
-                candidates = []
-                if shrink_candidates and exact_candidates:
-                    best_shrink = shrink_candidates[-1]  # Largest paper within shrink range
-                    best_exact = exact_candidates[0]     # Smallest paper that fits exactly
-                    
-                    exact_waste = best_exact[1] - page_width
-                    shrink_amount = page_width - best_shrink[1]
-                    shrink_pct = shrink_amount / best_shrink[1]
-                    
-                    # Use shrink if it wastes less than exact fit
-                    if exact_waste > shrink_amount:
-                        candidates = [best_shrink] + exact_candidates
-                        logger.info(
-                            f"Sheet '{sheet.Name}': Shrink candidate {best_shrink[2]} "
-                            f"({best_shrink[1]:.2f}\") saves {exact_waste - shrink_amount:.2f}\" "
-                            f"vs exact {best_exact[2]} ({best_exact[1]:.2f}\") "
-                            f"(shrink {shrink_pct:.1%})"
-                        )
-                    else:
-                        candidates = exact_candidates
-                elif shrink_candidates:
-                    # No exact fit, use largest shrink candidate
-                    candidates = [shrink_candidates[-1]]
-                elif exact_candidates:
-                    candidates = exact_candidates
-                else:
-                    # Content exceeds all paper sizes
-                    candidates = [filtered_catalog[-1]] if filtered_catalog else [paper_catalog[-1]]
-                    oversized = True
-                
-                # Try to set paper size + orientation (best candidate first)
-                PAPER_SIZE_TIMEOUT = 3
-                for (enum_to_try, limit_to_try, name_to_try, orient_to_try) in candidates:
-                    orient_set = self._safe_set_page_property(
-                        page_setup, 'Orientation', orient_to_try
-                    )
-                    if not orient_set:
-                        continue
-                    
-                    success = self._try_set_paper_size(
-                        page_setup, enum_to_try, name_to_try, PAPER_SIZE_TIMEOUT
-                    )
-                    if success:
-                        selected_paper = enum_to_try
-                        selected_name = name_to_try
-                        selected_orientation = orient_to_try
-                        limit_width = limit_to_try
-                        orient_label = "Landscape" if orient_to_try == xlLandscape else "Portrait"
-                        if limit_to_try >= page_width:
-                            waste = limit_to_try - page_width
-                            logger.info(
-                                f"Sheet '{sheet.Name}': Selected {orient_label} {selected_name} "
-                                f"({limit_width:.2f}\") for content width {page_width:.2f}\" "
-                                f"(waste: {waste:.2f}\")"
-                            )
-                        else:
-                            shrink_pct = (page_width - limit_to_try) / limit_to_try
-                            logger.info(
-                                f"Sheet '{sheet.Name}': Selected {orient_label} {selected_name} "
-                                f"({limit_width:.2f}\") for content width {page_width:.2f}\" "
-                                f"(shrink-to-fit: {shrink_pct:.1%})"
-                            )
-                        paper_set_success = True
-                        break
-                
-                if not paper_set_success:
-                    logger.warning(
-                        f"Could not set any appropriate paper size for width {page_width:.2f}\". "
-                        f"Printer may lack support for large sizes."
-                    )
-                    fallback_sizes = list(reversed(filtered_catalog or paper_catalog))
-                    for (fb_enum, fb_width, fb_name, fb_orient) in fallback_sizes:
-                        self._safe_set_page_property(page_setup, 'Orientation', fb_orient)
-                        success = self._try_set_paper_size(
-                            page_setup, fb_enum, fb_name, PAPER_SIZE_TIMEOUT
-                        )
-                        if success:
-                            selected_paper = fb_enum
-                            selected_name = fb_name
-                            selected_orientation = fb_orient
-                            limit_width = fb_width
-                            paper_set_success = True
-                            logger.info(
-                                f"Fallback: Using '{fb_name}' ({fb_width:.2f}\") - "
-                                f"largest size supported by printer."
-                            )
-                            break
-                    
-                    if not paper_set_success:
-                        logger.warning("Could not set any paper size. Using printer default.")
-
-            # 3. Oversized validation
-            if oversized:
-                effective_catalog = filtered_catalog or paper_catalog
-                effective_limit_width = limit_width if paper_set_success else effective_catalog[-1][1]
-                effective_limit_name = selected_name if paper_set_success else effective_catalog[-1][2]
-            
-                try:
-                    app = sheet.Application
-                    printer_max_width = self._get_active_printer_max_width_inches(app)
-                    if printer_max_width and printer_max_width > effective_limit_width:
-                        effective_limit_width = printer_max_width
-                        effective_limit_name = "active printer max form"
-                except Exception:
-                    pass
-                
-                shrink_factor = effective_limit_width / page_width
-                if shrink_factor < excel_settings.min_shrink_factor:
-                    err_msg = (
-                        f"Sheet '{sheet.Name}': Content is too wide ({page_width:.2f}\") for "
-                        f"'{effective_limit_name}' ({effective_limit_width:.2f}\"). "
-                        f"Shrink factor {shrink_factor:.2f} is below {excel_settings.min_shrink_factor} threshold."
-                    )
-                    if excel_settings.oversized_action == "skip":
-                        logger.warning(f"{err_msg} Skipping sheet.")
-                        raise OversizedSheetError(err_msg)
-                    elif excel_settings.oversized_action == "warn":
-                        logger.warning(f"{err_msg} Continuing anyway (oversized_action=warn).")
-                    else:
-                        logger.error(err_msg)
-                        raise ValueError(err_msg)
-                else:
-                    logger.warning(
-                        f"Sheet '{sheet.Name}': Content slightly larger than largest paper. "
-                        f"Shrinking to fit (Factor: {shrink_factor:.2f})"
-                    )
-
-            # 4. Final Setup - Apply remaining page setup properties with timeout protection
-            # These can also hang on unresponsive printer drivers
-            self._safe_set_page_property(page_setup, 'Zoom', False)
-            self._safe_set_page_property(page_setup, 'FitToPagesWide', 1)
-            self._safe_set_page_property(page_setup, 'BlackAndWhite', False)  # Ensure color rendering for charts/text labels
-            self._apply_row_dimensions(sheet, page_setup, excel_settings)
-            
-            # Margins - apply with timeout protection
-            margin_points = 36 # 0.5 inch
-            top_margin = 72 if excel_settings.metadata_header else 36
-            self._safe_set_page_property(page_setup, 'LeftMargin', margin_points)
-            self._safe_set_page_property(page_setup, 'RightMargin', margin_points)
-            self._safe_set_page_property(page_setup, 'TopMargin', top_margin)
-            self._safe_set_page_property(page_setup, 'BottomMargin', margin_points)
-            
-            # CRITICAL: Re-enable PrintCommunication to commit all PageSetup changes
-            try:
-                app = sheet.Application
-                app.PrintCommunication = True
-            except:
-                pass
-            
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.warning(f"Could not apply some page setup settings for '{sheet.Name}': {e}")
-
-    def _apply_row_dimensions(self, sheet, page_setup, excel_settings: ExcelSettings) -> None:
-        """Apply vertical pagination based on row_dimensions with timeout protection."""
+        if excel_settings.print_title_columns is not None:
+            self._apply_print_title_override(
+                sheet, "PrintTitleColumns", excel_settings.print_title_columns
+            )
         try:
-            if excel_settings.row_dimensions == 0:
-                # Fit entire sheet on one page
-                self._safe_set_page_property(page_setup, 'FitToPagesTall', 1)
-            elif excel_settings.row_dimensions:
-                # Multiple pages based on row count
-                used_rows = sheet.UsedRange.Rows.Count
-                pages_tall = max(1, (used_rows + excel_settings.row_dimensions - 1) // excel_settings.row_dimensions)
-                self._safe_set_page_property(page_setup, 'FitToPagesTall', pages_tall)
+            expected_title_rows = str(page_setup.PrintTitleRows or "").strip()
+            expected_title_columns = str(
+                page_setup.PrintTitleColumns or ""
+            ).strip()
+        except Exception as exc:
+            raise ValueError(
+                f"Sheet '{sheet.Name}': cannot read final print-title settings: {exc}"
+            ) from exc
+
+        content_width, content_height = self._calculate_smart_page_size(
+            sheet, last_col, content_width_points, content_height_points
+        )
+        orientation_setting = excel_settings.orientation.lower()
+        orientations = (
+            (xlPortrait, xlLandscape) if orientation_setting == "auto"
+            else (xlLandscape,) if orientation_setting == "landscape"
+            else (xlPortrait,)
+        )
+        requested_margins = (
+            36.0,
+            36.0,
+            72.0 if excel_settings.metadata_header else 36.0,
+            36.0,
+        )
+        quality_zoom = max(
+            10,
+            min(100, int(math.ceil(
+                (float(excel_settings.min_shrink_factor) * 100.0) - 1e-9
+            ))),
+        )
+        fit_tall = (
+            excel_settings.row_dimensions == 0
+            or excel_settings.oversized_action == "error"
+        )
+        (
+            title_width,
+            title_height,
+            title_extra_width,
+            title_extra_height,
+        ) = self._measure_print_titles(sheet)
+        planned_content_width = content_width + title_extra_width
+        planned_content_height = content_height + title_extra_height
+        candidates: List[LayoutCandidate] = []
+        for form in self._get_printer_paper_forms(app):
+            for orientation in orientations:
+                actual_margins = self._probe_paper_orientation(
+                    page_setup, form, orientation, requested_margins
+                )
+                if actual_margins is None:
+                    continue
+                candidates.append(self._build_layout_candidate(
+                    form=form,
+                    orientation=orientation,
+                    content_width_inches=planned_content_width,
+                    content_height_inches=planned_content_height,
+                    fit_tall=fit_tall,
+                    margins_points=actual_margins,
+                    quality_zoom=quality_zoom,
+                    title_width_inches=title_width,
+                    title_height_inches=title_height,
+                ))
+        if not candidates:
+            raise ValueError(f"Sheet '{sheet.Name}': active printer accepted no supported paper form")
+
+        selected = self._select_fit_candidate(candidates, quality_zoom)
+        use_fit_to_pages = False
+        if selected is not None:
+            zoom_value = selected.max_zoom
+            layout_mode = "quality-fit"
+        else:
+            best_quality = min(candidates, key=self._fit_candidate_sort_key)
+            message = (
+                f"Sheet '{sheet.Name}': best required-axis scale "
+                f"{best_quality.effective_scale:.3f} on {best_quality.form.name} "
+                f"is below min_shrink_factor "
+                f"{excel_settings.min_shrink_factor:.3f}"
+            )
+            if excel_settings.oversized_action == "skip":
+                raise OversizedSheetError(message)
+            if excel_settings.oversized_action == "warn":
+                logger.warning(message)
+                selected = best_quality
+                zoom_value = False
+                use_fit_to_pages = True
+                layout_mode = "low-quality-fit"
+            elif excel_settings.oversized_action == "paginate":
+                selected = self._select_paginated_candidate(candidates)
+                zoom_value = quality_zoom
+                layout_mode = "quality-paginate"
             else:
-                # Auto - let Excel decide
-                self._safe_set_page_property(page_setup, 'FitToPagesTall', False)
-        except Exception as e:
-            logger.debug(f"Could not apply row dimensions: {e}")
+                raise ValueError(message)
+
+        if selected is None:  # Defensive narrowing for type checkers and mocks.
+            raise ValueError(f"Sheet '{sheet.Name}': layout selection failed")
+
+        self._required_set_page_property(page_setup, "PaperSize", selected.form.paper_enum)
+        self._required_set_page_property(page_setup, "Orientation", selected.orientation)
+        for prop_name, value in zip(
+            ("LeftMargin", "RightMargin", "TopMargin", "BottomMargin"),
+            selected.margins_points,
+        ):
+            self._required_set_page_property(page_setup, prop_name, value)
+        if use_fit_to_pages:
+            self._required_set_page_property(page_setup, "Zoom", False)
+            self._required_set_page_property(page_setup, "FitToPagesWide", 1)
+            self._required_set_page_property(
+                page_setup, "FitToPagesTall", 1 if fit_tall else False
+            )
+        else:
+            self._required_set_page_property(page_setup, "FitToPagesWide", False)
+            self._required_set_page_property(page_setup, "FitToPagesTall", False)
+            self._required_set_page_property(page_setup, "Zoom", zoom_value)
+        self._required_set_page_property(page_setup, "BlackAndWhite", False)
+        app.PrintCommunication = True
+        final_expected = {
+            "PaperSize": selected.form.paper_enum,
+            "Orientation": selected.orientation,
+            "LeftMargin": selected.margins_points[0],
+            "RightMargin": selected.margins_points[1],
+            "TopMargin": selected.margins_points[2],
+            "BottomMargin": selected.margins_points[3],
+            "Zoom": zoom_value,
+            "FitToPagesWide": 1 if use_fit_to_pages else False,
+            "FitToPagesTall": (
+                (1 if fit_tall else False) if use_fit_to_pages else False
+            ),
+            "BlackAndWhite": False,
+        }
+        for prop_name, expected in final_expected.items():
+            try:
+                actual = getattr(page_setup, prop_name)
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot verify final PageSetup.{prop_name} for "
+                    f"sheet '{sheet.Name}': {exc}"
+                ) from exc
+            if not self._page_property_matches(actual, expected):
+                raise ValueError(
+                    f"Excel did not retain final PageSetup.{prop_name} for "
+                    f"sheet '{sheet.Name}': expected {expected!r}, "
+                    f"read back {actual!r}"
+                )
+        self._verify_print_title_readback(
+            sheet, "PrintTitleRows", expected_title_rows
+        )
+        self._verify_print_title_readback(
+            sheet, "PrintTitleColumns", expected_title_columns
+        )
+        logger.info(
+            f"Sheet '{sheet.Name}': {layout_mode}, {selected.form.name} "
+            f"{'landscape' if selected.orientation == xlLandscape else 'portrait'}, "
+            f"content={planned_content_width:.2f}x"
+            f"{planned_content_height:.2f}in, "
+            f"usable={selected.usable_width_inches:.2f}x"
+            f"{selected.usable_height_inches:.2f}in, "
+            f"width_scale={selected.width_scale:.3f}, "
+            f"height_scale={selected.height_scale:.3f}, "
+            f"effective_scale={selected.effective_scale:.3f}, "
+            f"limiting_axis={selected.limiting_axis}, zoom={zoom_value}, "
+            f"estimated_pages={selected.pages_wide}x{selected.pages_tall}"
+        )
 
     def _apply_metadata_header(
         self, 
@@ -1506,10 +1796,16 @@ class ExcelConverter(Converter):
                             last_sheet = temp_wb.Sheets(temp_wb.Sheets.Count)
                             # Copy after last_sheet
                             s.Copy(None, last_sheet)
-                            logger.debug(f"Copied sheet {idx}/{len(sheets)}. New count: {temp_wb.Sheets.Count}")
+                            logger.debug(
+                                f"Copied sheet {idx}/{len(sheets)}. "
+                                f"New count: {temp_wb.Sheets.Count}"
+                            )
                         except Exception as copy_err:
                             logger.error(f"Failed to copy sheet {idx}: {copy_err}")
-                            # Continue with remaining sheets
+                            raise ValueError(
+                                f"Failed to copy sheet {idx}/{len(sheets)} "
+                                "into the temporary export workbook"
+                            ) from copy_err
                     
                     # Export workbook - all sheets will be included automatically
                     count = temp_wb.Sheets.Count
@@ -1540,6 +1836,89 @@ class ExcelConverter(Converter):
         except Exception as e:
             logger.error(f"Failed to export to PDF: {e}")
             raise
+
+    def _copy_region_sheet(self, workbook, source_sheet, region: SheetRegion):
+        """Copy a worksheet and assign one verified, independent print region."""
+        last_sheet = workbook.Sheets(workbook.Sheets.Count)
+        source_sheet.Copy(None, last_sheet)
+        copied = workbook.Sheets(workbook.Sheets.Count)
+        first_col = self._col_num_to_letter(region.first_col)
+        last_col = self._col_num_to_letter(region.last_col)
+        print_area = (
+            f"${first_col}${region.first_row}:${last_col}${region.last_row}"
+        )
+        self._required_set_page_property(copied.PageSetup, "PrintArea", print_area)
+        return copied
+
+    def _resolve_sheet_regions(self, sheet, policy: str) -> List[SheetRegion]:
+        """Resolve preserved Range.Areas or automatic cell/shape content bounds."""
+        if policy == "preserve":
+            try:
+                print_area = str(sheet.PageSetup.PrintArea or "").strip()
+                if print_area:
+                    areas = sheet.Range(print_area).Areas
+                    regions = []
+                    for index in range(1, int(areas.Count) + 1):
+                        area = areas(index)
+                        regions.append(SheetRegion(
+                            int(area.Row), int(area.Column),
+                            int(area.Row + area.Rows.Count - 1),
+                            int(area.Column + area.Columns.Count - 1),
+                        ))
+                    if regions:
+                        return regions
+            except Exception as exc:
+                logger.warning(
+                    f"Sheet '{sheet.Name}': invalid PrintArea ignored: {exc}"
+                )
+
+        first_row = first_col = None
+        last_row = last_col = None
+        # Search formulas as well as displayed values. Page breaks are deliberately
+        # excluded: they describe pagination, not visible content.
+        for look_in in (-4123, -4163):  # xlFormulas, xlValues
+            try:
+                first_r = sheet.Cells.Find(
+                    What="*", After=sheet.Range("A1"), LookIn=look_in, LookAt=2,
+                    SearchOrder=self.xlByRows, SearchDirection=1,
+                )
+                last_r = sheet.Cells.Find(
+                    What="*", After=sheet.Range("A1"), LookIn=look_in, LookAt=2,
+                    SearchOrder=self.xlByRows, SearchDirection=self.xlPrevious,
+                )
+                first_c = sheet.Cells.Find(
+                    What="*", After=sheet.Range("A1"), LookIn=look_in, LookAt=2,
+                    SearchOrder=self.xlByColumns, SearchDirection=1,
+                )
+                last_c = sheet.Cells.Find(
+                    What="*", After=sheet.Range("A1"), LookIn=look_in, LookAt=2,
+                    SearchOrder=self.xlByColumns, SearchDirection=self.xlPrevious,
+                )
+                if all((first_r, last_r, first_c, last_c)):
+                    first_row = min(first_row or first_r.Row, int(first_r.Row))
+                    last_row = max(last_row or last_r.Row, int(last_r.Row))
+                    first_col = min(first_col or first_c.Column, int(first_c.Column))
+                    last_col = max(last_col or last_c.Column, int(last_c.Column))
+            except Exception:
+                continue
+
+        # Include visible shapes by their anchor cells. Hidden shapes do not render.
+        try:
+            for index in range(1, int(sheet.Shapes.Count) + 1):
+                shape = sheet.Shapes(index)
+                if hasattr(shape, "Visible") and not bool(shape.Visible):
+                    continue
+                top_left = shape.TopLeftCell
+                bottom_right = shape.BottomRightCell
+                first_row = min(first_row or top_left.Row, int(top_left.Row))
+                first_col = min(first_col or top_left.Column, int(top_left.Column))
+                last_row = max(last_row or bottom_right.Row, int(bottom_right.Row))
+                last_col = max(last_col or bottom_right.Column, int(bottom_right.Column))
+        except Exception:
+            pass
+        if None in (first_row, first_col, last_row, last_col):
+            return []
+        return [SheetRegion(first_row, first_col, last_row, last_col)]
 
     def _get_print_area_bounds(self, sheet) -> Tuple[int, int]:
         """
@@ -1896,45 +2275,3 @@ class ExcelConverter(Converter):
             logger.warning(f"Failed to calculate geometry dimensions: {e}")
             
         return max_width, max_height, last_row, last_col
-
-
-# Add near other helpers, before _apply_page_setup
-def _get_active_printer_max_width_inches(self, app) -> Optional[float]:
-    try:
-        active_printer = str(app.ActivePrinter or "")
-    except Exception:
-        return None
-
-    printer_name = active_printer.split(" on ")[0].strip()
-    if not printer_name:
-        return None
-
-    handle = None
-    try:
-        handle = win32print.OpenPrinter(printer_name)
-        forms = win32print.EnumForms(handle)
-    except Exception:
-        return None
-    finally:
-        if handle:
-            try:
-                win32print.ClosePrinter(handle)
-            except Exception:
-                pass
-
-    max_width_inches = None
-    for form in forms or []:
-        size = form.get("Size")  # thousandths of mm
-        if not size or len(size) != 2:
-            continue
-        try:
-            width_inches = (max(size[0], size[1]) / 1000.0) / 25.4
-        except Exception:
-            continue
-        if width_inches > 0 and (max_width_inches is None or width_inches > max_width_inches):
-            max_width_inches = width_inches
-
-    if max_width_inches is None:
-        return None
-
-    return min(max_width_inches, self.MAX_PAGE_WIDTH_INCHES)

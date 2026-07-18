@@ -1,0 +1,20 @@
+cases:
+  word_large_table:
+    source: word_large_table.docx
+    trim: { enabled: true, box_mode: physical, margin: 10 }
+    assertions:
+      - header row remains readable
+      - left and right sentinels survive PDF export
+      - vertical pagination is allowed
+  word_wide_legal:
+    source: word_wide_legal.docx
+    trim: { enabled: true, box_mode: physical, margin: 10 }
+    assertions:
+      - wide Legal page is detected and trimmed without clipping
+  powerpoint_edge_cases:
+    source: powerpoint_edge_cases.pptx
+    trim: { enabled: true, box_mode: physical, margin: 10 }
+    assertions:
+      - all three slides export
+      - full-bleed vector page is not cropped
+      - wide-content sentinel survives

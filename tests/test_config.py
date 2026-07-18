@@ -1,14 +1,17 @@
-import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
+import pytest
+
 from src.config import (
-    get_pdf_settings, 
-    _merge_dict, 
-    PDFConversionSettings, 
-    LayoutSettings, 
-    MetadataSettings,
-    PdfHandlingSettings,
-    get_pdf_handling_config
+    ExcelSettings,
+    PDFConversionSettings,
+    TrimWhitespaceSettings,
+    _merge_dict,
+    get_excel_sheet_settings,
+    get_pdf_handling_config,
+    get_pdf_settings,
+    load_config,
 )
 
 
@@ -127,4 +130,128 @@ def test_get_pdf_handling_config(mock_load_config):
     with patch("src.config.load_config", return_value={}):
         config = get_pdf_handling_config()
         assert config.copy_to_output is False
+
+
+def test_excel_settings_quality_first_defaults():
+    settings = ExcelSettings()
+
+    assert settings.orientation == "auto"
+    assert settings.min_shrink_factor == pytest.approx(0.90)
+    assert settings.oversized_action == "paginate"
+    assert settings.print_title_rows is None
+    assert settings.print_title_columns is None
+
+
+def test_excel_settings_accept_print_titles_and_paginate_action():
+    settings = ExcelSettings(
+        oversized_action="paginate",
+        print_title_rows="$1:$2",
+        print_title_columns="$A:$B",
+    )
+
+    assert settings.print_title_rows == "$1:$2"
+    assert settings.print_title_columns == "$A:$B"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("print_title_rows", ""),
+        ("print_title_rows", 1),
+        ("print_title_columns", "   "),
+        ("print_title_columns", False),
+    ],
+)
+def test_excel_settings_reject_invalid_print_titles(field, value):
+    with pytest.raises(ValueError, match=field):
+        ExcelSettings(**{field: value})
+
+
+def test_deprecated_page_shrink_threshold_warns_and_is_removed():
+    with pytest.warns(FutureWarning, match="page_shrink_threshold"):
+        settings = PDFConversionSettings.from_dict(
+            {
+                "excel": {
+                    "orientation": "portrait",
+                    "page_shrink_threshold": 0.30,
+                }
+            }
+        )
+
+    assert settings.excel is not None
+    assert settings.excel.orientation == "portrait"
+    assert not hasattr(settings.excel, "page_shrink_threshold")
+
+
+def test_flat_excel_print_title_settings_are_loaded():
+    settings = PDFConversionSettings.from_dict(
+        {
+            "print_title_rows": "$1:$3",
+            "print_title_columns": "$A:$A",
+        }
+    )
+
+    assert settings.excel is not None
+    assert settings.excel.print_title_rows == "$1:$3"
+    assert settings.excel.print_title_columns == "$A:$A"
+
+
+def test_sheet_specific_merge_preserves_all_excel_base_settings():
+    base = PDFConversionSettings(
+        excel=ExcelSettings(
+            oversized_action="warn",
+            print_title_rows="$1:$2",
+            print_title_columns="$A:$B",
+        )
+    )
+
+    with patch("src.config.load_config", return_value={"pdf_settings": {"excel": []}}):
+        settings = get_excel_sheet_settings("Data", base_settings=base)
+
+    assert settings.excel is not None
+    assert settings.excel.oversized_action == "warn"
+    assert settings.excel.print_title_rows == "$1:$2"
+    assert settings.excel.print_title_columns == "$A:$B"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"orientation": "diagonal"},
+        {"row_dimensions": -1},
+        {"row_dimensions": 1.5},
+        {"row_dimensions": True},
+        {"min_shrink_factor": 0},
+        {"min_shrink_factor": 1.1},
+        {"min_shrink_factor": "0.9"},
+        {"min_shrink_factor": True},
+        {"oversized_action": "maybe"},
+        {"print_area_policy": "replace"},
+    ],
+)
+def test_invalid_excel_settings_are_fatal(kwargs):
+    with pytest.raises(ValueError):
+        ExcelSettings(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"margin": -1},
+        {"box_mode": "media"},
+        {"render_dpi": 17},
+        {"max_render_pixels": 0},
+        {"background_tolerance": 256},
+    ],
+)
+def test_invalid_trim_settings_are_fatal(kwargs):
+    with pytest.raises(ValueError):
+        TrimWhitespaceSettings(**kwargs)
+
+
+def test_malformed_yaml_is_fatal(tmp_path):
+    malformed = tmp_path / "bad.yml"
+    malformed.write_text("settings: [unterminated", encoding="utf-8")
+    with pytest.raises(ValueError, match="Malformed YAML"):
+        load_config(malformed)
 

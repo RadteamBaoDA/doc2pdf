@@ -29,6 +29,7 @@ from .version import __version__
 from .core.word_converter import WordConverter
 from .core.powerpoint_converter import PowerPointConverter
 from .core.excel_converter import ExcelConverter
+from .core.macro_converter import MacroConverter, SUPPORTED_FORMATS
 from .core.pdf_processor import PDFProcessor
 from .utils.logger import setup_logger, logger
 from .config import (
@@ -215,6 +216,48 @@ def get_file_type(path: Path) -> FileType:
     elif ext == ".pdf":
         return "pdf"
     return "word" # Default fallback
+
+
+@app.command("convert-macros")
+def convert_macros(
+    input_path: Path = typer.Argument(..., help="Macro-enabled Office file or directory", exists=True),
+    output_path: Path = typer.Option(Path("output"), "--output", "-o", help="Output file or directory"),
+):
+    """Convert .docm/.pptm/.xlsm files to .docx/.pptx/.xlsx (remove macros)."""
+    files = (
+        [input_path]
+        if input_path.is_file()
+        else sorted(
+            path
+            for path in input_path.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_FORMATS
+        )
+    )
+    if input_path.is_file() and input_path.suffix.lower() not in SUPPORTED_FORMATS:
+        raise typer.BadParameter("Input must be a .docm, .pptm, or .xlsm file")
+    if not files:
+        console.print(f"[yellow]No .docm, .pptm, or .xlsm files found in {input_path}.[/yellow]")
+        raise typer.Exit()
+
+    converter = MacroConverter()
+    failures = 0
+    for source in files:
+        target_extension = SUPPORTED_FORMATS[source.suffix.lower()][0]
+        if input_path.is_dir():
+            target = output_path / source.relative_to(input_path).with_suffix(target_extension)
+        elif output_path.suffix.lower() == target_extension:
+            target = output_path
+        else:
+            target = output_path / source.with_suffix(target_extension).name
+        try:
+            result = converter.convert(source, target)
+            console.print(f"[green]Converted:[/green] {source} -> {result}")
+        except Exception as error:
+            failures += 1
+            console.print(f"[red]Failed:[/red] {source}: {error}")
+
+    if failures:
+        raise typer.Exit(code=1)
 
 @app.command()
 def convert(

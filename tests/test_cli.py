@@ -86,6 +86,23 @@ def test_convert_missing_input():
     # Typer/Click prints validation errors to output/stderr
     assert "does not exist" in result.output or "Invalid value" in result.output
 
+
+@patch("src.cli.MacroConverter")
+def test_convert_macros_directory(mock_converter_cls):
+    mock_converter_cls.return_value.convert.side_effect = lambda source, target: target
+    with runner.isolated_filesystem():
+        input_dir = Path("input")
+        (input_dir / "nested").mkdir(parents=True)
+        (input_dir / "a.docm").touch()
+        (input_dir / "nested" / "b.pptm").touch()
+        (input_dir / "nested" / "c.xlsm").touch()
+
+        result = runner.invoke(app, ["convert-macros", "input", "--output", "clean"])
+
+    assert result.exit_code == 0
+    targets = [call.args[1] for call in mock_converter_cls.return_value.convert.call_args_list]
+    assert targets == [Path("clean/a.docx"), Path("clean/nested/b.pptx"), Path("clean/nested/c.xlsx")]
+
 @patch("src.cli.get_pdf_handling_config")
 @patch("src.cli.shutil.copy2")
 def test_convert_pdf_copy(mock_copy, mock_get_config):

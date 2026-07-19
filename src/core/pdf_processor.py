@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 import pypdfium2 as pdfium
 from PIL import Image, ImageChops
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, RectangleObject
+from pypdf.generic import ContentStream, NameObject, RectangleObject
 
 from ..utils.logger import logger
 
@@ -119,6 +119,8 @@ class PDFProcessor:
                     background_tolerance, include_annotations,
                 )
                 if bounds is None:
+                    bounds = self._content_stream_bounds(reader.pages[index], visible)
+                if bounds is None:
                     logger.debug(f"Page {index + 1}: blank; left unchanged")
                     continue
                 proposed = self._margin_and_clamp(bounds, visible, margin)
@@ -142,6 +144,64 @@ class PDFProcessor:
         )
         return target
 
+    def verify_preserved_content(
+        self,
+        source_path: Path,
+        trimmed_path: Path,
+        *,
+        render_dpi: int = 150,
+        max_render_pixels: int = 20_000_000,
+        background_tolerance: int = 8,
+        include_annotations: bool = True,
+    ) -> None:
+        """Verify that trim retained source text and every rendered ink bound."""
+        source_reader = PdfReader(str(source_path))
+        target_reader = PdfReader(str(trimmed_path))
+        if len(source_reader.pages) != len(target_reader.pages):
+            raise PDFTrimError("Trim verification detected a page-count change")
+        source_document = pdfium.PdfDocument(str(source_path))
+        try:
+            for index, (source_page, target_page) in enumerate(
+                zip(source_reader.pages, target_reader.pages, strict=True)
+            ):
+                source_text = source_page.extract_text() or ""
+                target_text = target_page.extract_text() or ""
+                if source_text != target_text:
+                    raise PDFTrimError(
+                        f"Trim verification detected a text change on page {index + 1}"
+                    )
+                visible = _intersection(
+                    _box(source_page.mediabox), _box(source_page.cropbox)
+                )
+                target_visible = _intersection(
+                    _box(target_page.mediabox), _box(target_page.cropbox)
+                )
+                if visible is None or target_visible is None:
+                    raise PDFTrimError(
+                        f"Trim verification found invalid boxes on page {index + 1}"
+                    )
+                ink = self._detect_page_bounds(
+                    source_document[index], visible, render_dpi,
+                    max_render_pixels, background_tolerance,
+                    include_annotations,
+                )
+                if ink is None:
+                    ink = self._content_stream_bounds(source_page, visible)
+                if ink is None:
+                    continue
+                tolerance = 1.5
+                if (
+                    target_visible[0] > ink[0] + tolerance
+                    or target_visible[1] > ink[1] + tolerance
+                    or target_visible[2] < ink[2] - tolerance
+                    or target_visible[3] < ink[3] - tolerance
+                ):
+                    raise PDFTrimError(
+                        f"Trim verification detected clipped ink on page {index + 1}"
+                    )
+        finally:
+            source_document.close()
+
     @staticmethod
     def _validate_options(
         source: Path, margin: float, box_mode: str, render_dpi: int,
@@ -163,7 +223,7 @@ class PDFProcessor:
     @staticmethod
     def _has_signatures(reader: PdfReader) -> bool:
         root = reader.trailer.get("/Root", {})
-        if root.get("/Perms"):
+        if "/Perms" in root:
             return True
         acroform = root.get("/AcroForm")
         if not acroform:
@@ -250,6 +310,59 @@ class PDFProcessor:
             converter = None
         bitmap.close()
         return image, converter
+
+    @staticmethod
+    def _content_stream_bounds(page, visible: Box) -> Optional[Box]:
+        """Fallback for simple vector paths that a renderer cannot inspect."""
+        try:
+            content = page.get_contents()
+            if content is None:
+                return None
+            stream = ContentStream(content, page.pdf)
+        except Exception:
+            return None
+        current = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+        stack = []
+        union: Optional[Box] = None
+
+        def transform(x: float, y: float) -> Tuple[float, float]:
+            return (
+                x * current[0] + y * current[2] + current[4],
+                x * current[1] + y * current[3] + current[5],
+            )
+
+        for operands, operator in stream.operations:
+            if operator == b"q":
+                stack.append(current)
+            elif operator == b"Q":
+                current = stack.pop() if stack else (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            elif operator == b"cm" and len(operands) == 6:
+                a, b, c, d, e, f = (float(value) for value in operands)
+                a0, b0, c0, d0, e0, f0 = current
+                current = (
+                    a * a0 + b * c0, a * b0 + b * d0,
+                    c * a0 + d * c0, c * b0 + d * d0,
+                    e * a0 + f * c0 + e0, e * b0 + f * d0 + f0,
+                )
+            elif operator == b"re" and len(operands) == 4:
+                x, y, width, height = (float(value) for value in operands)
+                points = (
+                    transform(x, y), transform(x + width, y),
+                    transform(x, y + height), transform(x + width, y + height),
+                )
+                candidate = (
+                    min(point[0] for point in points),
+                    min(point[1] for point in points),
+                    max(point[0] for point in points),
+                    max(point[1] for point in points),
+                )
+                candidate = _intersection(candidate, visible)
+                if candidate is not None:
+                    union = candidate if union is None else (
+                        min(union[0], candidate[0]), min(union[1], candidate[1]),
+                        max(union[2], candidate[2]), max(union[3], candidate[3]),
+                    )
+        return union
 
     @staticmethod
     def _ink_bounds(image: Image.Image, tolerance: int) -> Optional[Tuple[int, int, int, int]]:

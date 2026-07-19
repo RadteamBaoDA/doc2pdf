@@ -1,8 +1,17 @@
+import time
+from pathlib import Path
+from threading import Event, Lock
+from unittest.mock import MagicMock, patch
+
 import pytest
 from typer.testing import CliRunner
-from unittest.mock import patch, MagicMock
-from pathlib import Path
-from src.cli import app, get_file_type
+
+from src.cli import (
+    FileConversionResult,
+    app,
+    get_file_type,
+    run_parallel_excel_jobs,
+)
 from src.version import __version__
 
 runner = CliRunner()
@@ -35,6 +44,116 @@ def test_get_file_type():
     assert get_file_type(Path("test.xlsx")) == "excel"
     assert get_file_type(Path("test.ppt")) == "powerpoint"
     assert get_file_type(Path("unknown.txt")) == "word" # Fallback
+
+
+def test_parallel_excel_scheduler_respects_worker_limit():
+    files = [Path(f"book-{index}.xlsx") for index in range(5)]
+    lock = Lock()
+    active = 0
+    maximum_active = 0
+    completed = []
+
+    def worker(path):
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return FileConversionResult(path, path.with_suffix(".pdf"), "excel", "success")
+
+    run_parallel_excel_jobs(
+        files,
+        worker,
+        max_workers=2,
+        cancel_event=Event(),
+        on_complete=completed.append,
+    )
+
+    assert maximum_active == 2
+    assert {result.input_file for result in completed} == set(files)
+
+
+def test_parallel_excel_scheduler_supports_serial_mode():
+    files = [Path("one.xlsx"), Path("two.xlsx")]
+    order = []
+
+    def worker(path):
+        order.append(("start", path))
+        order.append(("end", path))
+        return FileConversionResult(path, path.with_suffix(".pdf"), "excel", "success")
+
+    run_parallel_excel_jobs(
+        files,
+        worker,
+        max_workers=1,
+        cancel_event=Event(),
+        on_complete=lambda result: order.append(("complete", result.input_file)),
+    )
+
+    assert order == [
+        ("start", files[0]), ("end", files[0]), ("complete", files[0]),
+        ("start", files[1]), ("end", files[1]), ("complete", files[1]),
+    ]
+
+
+def test_parallel_excel_scheduler_starts_heaviest_file_first(tmp_path):
+    small = tmp_path / "small.xls"
+    large = tmp_path / "large.xls"
+    small.write_bytes(b"x")
+    large.write_bytes(b"x" * 100)
+    order = []
+
+    def worker(path):
+        order.append(path)
+        return FileConversionResult(
+            path, path.with_suffix(".pdf"), "excel", "success"
+        )
+
+    run_parallel_excel_jobs(
+        [small, large],
+        worker,
+        max_workers=1,
+        cancel_event=Event(),
+        on_complete=lambda _result: None,
+    )
+
+    assert order == [large, small]
+
+
+def test_parallel_excel_scheduler_retries_only_transient_failure():
+    transient = Path("transient.xlsx")
+    quality = Path("quality.xlsx")
+    attempts = {transient: 0, quality: 0}
+    completed = []
+
+    def worker(path):
+        attempts[path] += 1
+        if path == transient and attempts[path] == 1:
+            return FileConversionResult(
+                path, None, "excel", "failed", "RPC server is unavailable"
+            )
+        if path == quality:
+            return FileConversionResult(
+                path, None, "excel", "failed", "PDF postflight failed: blank"
+            )
+        return FileConversionResult(
+            path, path.with_suffix(".pdf"), "excel", "success"
+        )
+
+    run_parallel_excel_jobs(
+        [transient, quality],
+        worker,
+        max_workers=2,
+        cancel_event=Event(),
+        on_complete=completed.append,
+    )
+
+    assert attempts == {transient: 2, quality: 1}
+    assert len(completed) == 2
+    assert next(item for item in completed if item.input_file == transient).status == "success"
+    assert next(item for item in completed if item.input_file == quality).status == "failed"
 
 @patch("src.cli.WordConverter")
 @patch("src.cli.get_files")
@@ -76,6 +195,56 @@ def test_convert_directory(mock_converter_cls):
         assert result.exit_code == 0
         # Should convert 2 files
         assert mock_instance.convert.call_count == 2
+
+
+@patch("src.cli.run_excel_job")
+@patch("src.cli.WordConverter")
+def test_convert_mixed_batch_parallelizes_only_excel(
+    mock_word_converter, mock_run_excel_job
+):
+    lock = Lock()
+    active_excel = 0
+    maximum_excel = 0
+
+    def convert_word(source, target, settings, base_path=None):
+        with lock:
+            assert active_excel == 0
+        target.write_bytes(b"word pdf")
+        return target
+
+    def convert_excel(source, target, settings, **kwargs):
+        nonlocal active_excel, maximum_excel
+        with lock:
+            active_excel += 1
+            maximum_excel = max(maximum_excel, active_excel)
+        time.sleep(0.05)
+        target.write_bytes(b"excel pdf")
+        with lock:
+            active_excel -= 1
+        return target
+
+    mock_word_converter.return_value.convert.side_effect = convert_word
+    mock_run_excel_job.side_effect = convert_excel
+
+    with runner.isolated_filesystem():
+        input_dir = Path("input")
+        input_dir.mkdir()
+        (input_dir / "document.docx").touch()
+        (input_dir / "one.xlsx").touch()
+        (input_dir / "two.xlsx").touch()
+
+        result = runner.invoke(app, ["convert", "input", "--output", "output"])
+
+        summary = next(Path("reports").glob("summary_*.txt")).read_text(
+            encoding="utf-8"
+        )
+
+    assert result.exit_code == 0, result.output
+    assert maximum_excel == 2
+    assert mock_word_converter.return_value.convert.call_count == 1
+    assert "Success: 3" in summary
+    assert "Failed:  0" in summary
+    assert "Skipped: 0" in summary
 
 def test_convert_missing_input():
     # We do NOT mock filesystem here to test generic Typer check, 

@@ -18,7 +18,7 @@ from pathlib import Path
 from src.core.word_converter import WordConverter
 from src.core.excel_converter import ExcelConverter
 from src.core.powerpoint_converter import PowerPointConverter
-from src.config import PDFConversionSettings
+from src.config import ExcelSettings, PDFConversionSettings
 
 
 # Sample multilingual text constants
@@ -203,7 +203,12 @@ class TestExcelConverterMultilingual:
         mock_workbook.ActiveSheet = mock_sheet
         mock_excel_app.Workbooks.Open.return_value = mock_workbook
 
-        result = converter.convert(input_file, settings=PDFConversionSettings())
+        result = converter.convert(
+            input_file,
+            settings=PDFConversionSettings(
+                excel=ExcelSettings(quality_profile="legacy")
+            ),
+        )
 
         mock_sheet.ExportAsFixedFormat.assert_called_once()
 
@@ -222,7 +227,12 @@ class TestExcelConverterMultilingual:
         mock_workbook.ActiveSheet = mock_sheet
         mock_excel_app.Workbooks.Open.return_value = mock_workbook
 
-        result = converter.convert(input_file, settings=PDFConversionSettings())
+        result = converter.convert(
+            input_file,
+            settings=PDFConversionSettings(
+                excel=ExcelSettings(quality_profile="legacy")
+            ),
+        )
 
         mock_sheet.ExportAsFixedFormat.assert_called_once()
 
@@ -258,7 +268,12 @@ class TestExcelConverterMultilingual:
         # Mock workbook.Application.ActiveWorkbook to return the temp workbook
         mock_workbook.Application.ActiveWorkbook = mock_temp_wb
 
-        result = converter.convert(input_file, settings=PDFConversionSettings())
+        result = converter.convert(
+            input_file,
+            settings=PDFConversionSettings(
+                excel=ExcelSettings(quality_profile="legacy")
+            ),
+        )
 
         # Verify workbook was opened
         mock_excel_app.Workbooks.Open.assert_called_once()

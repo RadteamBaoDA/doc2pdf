@@ -115,6 +115,8 @@ Command này chỉ đọc `.docm`, `.pptm`, `.xlsm`; các file khác trong thư 
 `config.yml` là cấu hình mặc định. Các nhóm chính hiện có gồm:
 
 - `timeout`: timeout chuyển đổi tài liệu và trim Excel.
+- `parallel.excel_workers`: số workbook Excel chạy đồng thời (`1`-`8`, mặc định
+  `2`; dùng `1` để chạy tuần tự).
 - `logging`: mức log, file log, rotation và retention.
 - `post_processing`: trim khoảng trắng sau khi tạo PDF.
 - `suffix`: hậu tố tên PDF theo Word, Excel, PowerPoint.

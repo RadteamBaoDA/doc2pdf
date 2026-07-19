@@ -1,9 +1,11 @@
-import yaml
-from pathlib import Path
-from typing import Any, Dict, Optional, List, Literal
-from dataclasses import dataclass, field, asdict
+import dataclasses
 import fnmatch
 import warnings
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
+
+import yaml
 
 _CONFIG_PATH: Path = Path("config.yml")
 
@@ -39,6 +41,61 @@ class TimeoutSettings:
         return cls(
             document_parsing=data.get("document_parsing", 3600),
             excel_trim=data.get("excel_trim", 3600)
+        )
+
+
+@dataclass
+class ParallelSettings:
+    """Bounded concurrency settings for batch conversion."""
+
+    excel_workers: int | Literal["auto"] = "auto"
+    excel_worker_cap: int = 4
+
+    def __post_init__(self) -> None:
+        if self.excel_workers != "auto" and (
+            isinstance(self.excel_workers, bool)
+            or not isinstance(self.excel_workers, int)
+            or not 1 <= self.excel_workers <= 8
+        ):
+            raise ValueError(
+                "parallel.excel_workers must be 'auto' or an integer between 1 and 8"
+            )
+        if (
+            isinstance(self.excel_worker_cap, bool)
+            or not isinstance(self.excel_worker_cap, int)
+            or not 1 <= self.excel_worker_cap <= 8
+        ):
+            raise ValueError(
+                "parallel.excel_worker_cap must be an integer between 1 and 8"
+            )
+
+    def resolve_excel_workers(
+        self,
+        file_count: int,
+        *,
+        logical_cpus: Optional[int],
+        available_memory_mb: Optional[int],
+    ) -> int:
+        """Resolve adaptive Excel concurrency without overcommitting the host."""
+        if file_count <= 0:
+            return 0
+        if isinstance(self.excel_workers, int):
+            return min(file_count, self.excel_workers)
+        cpu_limit = max(1, (logical_cpus or 2) // 2)
+        if available_memory_mb is None:
+            memory_limit = 2
+        else:
+            memory_limit = max(1, (available_memory_mb - 2048) // 1536)
+        return max(
+            1,
+            min(file_count, self.excel_worker_cap, cpu_limit, memory_limit),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ParallelSettings":
+        return cls(
+            excel_workers=data.get("excel_workers", "auto"),
+            excel_worker_cap=data.get("excel_worker_cap", 4),
         )
 
 
@@ -110,7 +167,15 @@ class PowerPointSettings:
 
 @dataclass
 class ExcelSettings:
-    """Excel-specific PDF conversion settings for OCR-optimized output."""
+    """Effective Excel conversion policy.
+
+    ``source_values`` retains only values explicitly supplied by configuration.
+    It is deliberately carried with the effective object so sheet rules can be
+    merged before profile defaults are expanded again.
+    """
+    quality_profile: str = "strict"  # strict, balanced, legacy
+    layout_policy: Optional[str] = None
+    page_size_scope: Optional[str] = None
     sheet_name: Optional[str] = None  # Target specific sheet, None = all visible sheets
     orientation: str = "auto"  # auto, portrait, landscape
     row_dimensions: Optional[int] = None  # None=auto, 0=try whole sheet, N=max rows per chunk
@@ -119,11 +184,70 @@ class ExcelSettings:
     ocr_sheet_name_label: bool = False  # Insert sheet name as large text in row 1 for OCR
     is_write_file_path: bool = False  # Insert file path row before last row
     oversized_action: str = "paginate"  # paginate, error, skip, or warn
-    print_area_policy: str = "preserve"  # preserve existing areas, or auto-detect
+    horizontal_overflow_strategy: str = "paginate"
+    print_area_policy: Optional[str] = None  # profile-specific
+    manual_page_break_policy: str = "preserve"
     print_title_rows: Optional[str] = None  # None preserves the workbook setting
     print_title_columns: Optional[str] = None  # None preserves the workbook setting
+    preferred_papers: List[str] = field(default_factory=lambda: ["A4", "A3"])
+    allowed_papers: Optional[List[str]] = None
+    max_page_dimension_in: float = 24.0
+    max_page_area_in2: float = 300.0
+    avoid_horizontal_pagination: bool = True
+    min_effective_font_pt: float = 10.0
+    min_effective_image_dpi: float = 150.0
+    print_quality: str = "standard"
+    draft_mode: bool = False
+    color_policy: str = "preserve"
+    metadata_header_policy: str = "preserve"
+    calculation_policy: str = "saved_cache"
+    external_link_policy: str = "never_refresh"
+    printer_policy: Optional[str] = None
+    printer_name: str = "Microsoft Print to PDF"
+    postflight_policy: Optional[str] = None
+    trim_policy: Optional[str] = None
+    # The extension provider fields are intentionally unavailable in M0-M5.
+    vector_stitch_provider: Optional[str] = None
+    pdfa_provider: Optional[str] = None
+    source_values: Dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        # Optional policy fields make direct ``ExcelSettings(quality_profile=...)``
+        # select the same defaults as YAML profile expansion while retaining the
+        # ability to reject an explicitly incompatible value.
+        profile_seed = EXCEL_PROFILE_DEFAULTS.get(self.quality_profile, {})
+        for name in (
+            "layout_policy", "page_size_scope", "print_area_policy",
+            "printer_policy", "postflight_policy", "trim_policy",
+        ):
+            if getattr(self, name) is None:
+                setattr(self, name, profile_seed.get(name))
+        enum_values = {
+            "quality_profile": {"strict", "balanced", "legacy"},
+            "layout_policy": {"preserve_authored", "optimize_missing", "force_optimize"},
+            "page_size_scope": {"sheet", "chunk"},
+            "orientation": {"portrait", "landscape", "auto"},
+            "oversized_action": {"paginate", "error", "skip", "warn"},
+            "horizontal_overflow_strategy": {
+                "paginate", "error", "one_logical_page", "vector_stitch"
+            },
+            "print_area_policy": {
+                "preserve", "preserve_strict", "expand_visible_objects", "auto"
+            },
+            "manual_page_break_policy": {"preserve", "reset"},
+            "print_quality": {"standard"},
+            "color_policy": {"preserve", "force_color", "black_and_white"},
+            "metadata_header_policy": {"preserve", "append", "replace"},
+            "calculation_policy": {"saved_cache", "calculate", "full_rebuild"},
+            "external_link_policy": {"never_refresh", "refresh_allowed"},
+            "printer_policy": {"required", "configured_fallback", "system_default"},
+            "postflight_policy": {"strict", "warn", "disabled"},
+            "trim_policy": {"disabled", "cropbox", "physical"},
+        }
+        for name, allowed in enum_values.items():
+            if getattr(self, name) not in allowed:
+                choices = ", ".join(sorted(allowed))
+                raise ValueError(f"excel.{name} must be one of: {choices}")
         if self.orientation not in {"portrait", "landscape", "auto"}:
             raise ValueError("excel.orientation must be portrait, landscape, or auto")
         if self.row_dimensions is not None and (
@@ -138,14 +262,121 @@ class ExcelSettings:
             or not 0 < float(self.min_shrink_factor) <= 1
         ):
             raise ValueError("excel.min_shrink_factor must be within (0, 1]")
-        if self.oversized_action not in {"paginate", "error", "skip", "warn"}:
-            raise ValueError("excel.oversized_action must be paginate, error, skip, or warn")
-        if self.print_area_policy not in {"preserve", "auto"}:
-            raise ValueError("excel.print_area_policy must be preserve or auto")
         for name in ("print_title_rows", "print_title_columns"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"excel.{name} must be null or a non-empty A1-style range")
+        for name in (
+            "metadata_header", "ocr_sheet_name_label", "is_write_file_path",
+            "avoid_horizontal_pagination", "draft_mode",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"excel.{name} must be a boolean")
+        for name in (
+            "max_page_dimension_in", "max_page_area_in2",
+            "min_effective_font_pt", "min_effective_image_dpi",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"excel.{name} must be > 0")
+        for name in ("preferred_papers", "allowed_papers"):
+            value = getattr(self, name)
+            if value is None and name == "allowed_papers":
+                continue
+            if not isinstance(value, list) or not value or any(
+                not isinstance(item, str) or not item.strip() for item in value
+            ):
+                raise ValueError(f"excel.{name} must be a non-empty list of paper names")
+        if not isinstance(self.printer_name, str) or not self.printer_name.strip():
+            raise ValueError("excel.printer_name must be a non-empty string")
+        if self.quality_profile == "strict":
+            if self.postflight_policy == "disabled":
+                raise ValueError("strict Excel profile cannot disable postflight")
+            if self.external_link_policy == "refresh_allowed":
+                raise ValueError("strict Excel profile cannot refresh external links")
+            if self.draft_mode or self.print_quality != "standard":
+                raise ValueError("strict Excel profile requires standard quality and Draft=False")
+        if self.quality_profile != "legacy" and self.page_size_scope == "chunk":
+            raise ValueError(
+                "excel.page_size_scope=chunk is available only in the legacy profile"
+            )
+        if self.quality_profile != "legacy" and self.postflight_policy == "disabled":
+            raise ValueError(
+                "excel.postflight_policy=disabled is available only in legacy"
+            )
+
+
+EXCEL_PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "strict": {
+        "quality_profile": "strict",
+        "layout_policy": "preserve_authored",
+        "page_size_scope": "sheet",
+        "orientation": "auto",
+        "min_shrink_factor": 0.90,
+        "oversized_action": "paginate",
+        "horizontal_overflow_strategy": "paginate",
+        "row_dimensions": None,
+        "print_area_policy": "preserve_strict",
+        "manual_page_break_policy": "preserve",
+        "preferred_papers": ["A4", "A3"],
+        "allowed_papers": None,
+        "max_page_dimension_in": 24.0,
+        "max_page_area_in2": 300.0,
+        "avoid_horizontal_pagination": True,
+        "min_effective_font_pt": 10.0,
+        "min_effective_image_dpi": 150.0,
+        "print_quality": "standard",
+        "draft_mode": False,
+        "color_policy": "preserve",
+        "metadata_header_policy": "preserve",
+        "metadata_header": True,
+        "ocr_sheet_name_label": False,
+        "is_write_file_path": False,
+        "calculation_policy": "saved_cache",
+        "external_link_policy": "never_refresh",
+        "printer_policy": "required",
+        "printer_name": "Microsoft Print to PDF",
+        "postflight_policy": "strict",
+        "trim_policy": "disabled",
+    },
+    "balanced": {
+        "quality_profile": "balanced",
+        "layout_policy": "preserve_authored",
+        "page_size_scope": "sheet",
+        "print_area_policy": "expand_visible_objects",
+        "postflight_policy": "warn",
+        "trim_policy": "cropbox",
+        "printer_policy": "configured_fallback",
+    },
+    "legacy": {
+        "quality_profile": "legacy",
+        "layout_policy": "optimize_missing",
+        "page_size_scope": "chunk",
+        "print_area_policy": "preserve",
+        "postflight_policy": "disabled",
+        "trim_policy": "disabled",
+        "printer_policy": "system_default",
+    },
+}
+EXCEL_PROFILE_DEFAULTS["balanced"] = {
+    **EXCEL_PROFILE_DEFAULTS["strict"],
+    **EXCEL_PROFILE_DEFAULTS["balanced"],
+}
+
+
+def _excel_settings_from_mapping(data: Dict[str, Any]) -> ExcelSettings:
+    """Expand an Excel profile, preserving the supplied keys for later merges."""
+    supplied = dict(data)
+    nested_source = supplied.pop("source_values", None)
+    if isinstance(nested_source, dict):
+        # This path is used when reconstructing an already-resolved settings object.
+        supplied = _merge_dict(nested_source, supplied)
+    profile = supplied.get("quality_profile", "strict")
+    if profile not in EXCEL_PROFILE_DEFAULTS:
+        raise ValueError("excel.quality_profile must be strict, balanced, or legacy")
+    effective = _merge_dict(EXCEL_PROFILE_DEFAULTS[profile], supplied)
+    effective["source_values"] = dict(supplied)
+    return ExcelSettings(**effective)
     
 @dataclass
 class SummaryReportSettings:
@@ -207,7 +438,7 @@ class PDFConversionSettings:
     layout: LayoutSettings = field(default_factory=LayoutSettings)
     metadata: MetadataSettings = field(default_factory=MetadataSettings)
     bookmarks: str = "headings"
-    compliance: str = "pdfa"
+    compliance: str = "standard"
     optimization: OptimizationSettings = field(default_factory=OptimizationSettings)
     powerpoint: Optional[PowerPointSettings] = None
     excel: Optional[ExcelSettings] = None
@@ -223,7 +454,10 @@ class PDFConversionSettings:
         # Excel settings can be in nested 'excel' key OR at top level
         excel_data = dict(data.get("excel", {}) or {})
         # Also check for top-level excel settings (flat structure)
-        top_level_excel_keys = ["orientation", "row_dimensions", "metadata_header", "sheet_name", "min_shrink_factor", "ocr_sheet_name_label", "is_write_file_path", "oversized_action", "page_shrink_threshold", "print_area_policy", "print_title_rows", "print_title_columns"]
+        top_level_excel_keys = [
+            field_info.name for field_info in dataclasses.fields(ExcelSettings)
+            if field_info.name != "source_values"
+        ] + ["page_shrink_threshold"]
         for key in top_level_excel_keys:
             if key in data:
                 # Top-level (flat) settings override nested 'excel' settings
@@ -242,10 +476,10 @@ class PDFConversionSettings:
             layout=LayoutSettings(**layout_data) if layout_data else LayoutSettings(),
             metadata=MetadataSettings(**metadata_data) if metadata_data else MetadataSettings(),
             bookmarks=data.get("bookmarks", "headings"),
-            compliance=data.get("compliance", "pdfa"),
+            compliance=data.get("compliance", "standard"),
             optimization=OptimizationSettings(**opt_data) if opt_data else OptimizationSettings(),
             powerpoint=PowerPointSettings(**ppt_data) if ppt_data else None,
-            excel=ExcelSettings(**excel_data) if excel_data else None,
+            excel=_excel_settings_from_mapping(excel_data) if excel_data else None,
         )
 
 def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
@@ -378,6 +612,15 @@ def get_timeout_config() -> TimeoutSettings:
         return TimeoutSettings()
     
     return TimeoutSettings.from_dict(timeout_data)
+
+
+def get_parallel_config() -> ParallelSettings:
+    """Get bounded batch-concurrency settings with validated defaults."""
+    config = load_config()
+    parallel_data = config.get("parallel", {})
+    if not isinstance(parallel_data, dict):
+        raise ValueError("parallel must be a mapping")
+    return ParallelSettings.from_dict(parallel_data)
 
 
 def _merge_dict(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
@@ -555,8 +798,18 @@ def get_excel_sheet_settings(sheet_name: str, base_settings: Optional[PDFConvers
     
     # Start with base settings dict or empty
     if base_settings:
-        # Preserve every current and future dataclass field during sheet overrides.
         final_settings_dict = asdict(base_settings)
+        # Profile expansion must happen after sheet rules.  Reuse the original
+        # Excel keys rather than feeding every effective default back as if it
+        # had been explicitly configured.
+        if base_settings.excel is not None:
+            raw_excel = base_settings.excel.source_values
+            if not raw_excel:
+                raw_excel = {
+                    key: value for key, value in asdict(base_settings.excel).items()
+                    if key != "source_values"
+                }
+            final_settings_dict["excel"] = dict(raw_excel)
     else:
         final_settings_dict = {}
     

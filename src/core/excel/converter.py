@@ -8,9 +8,11 @@ Features:
 - Metadata headers (sheet name, row range, filename)
 """
 import math
+import os
+import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import win32com.client
 import win32print
 import pythoncom
@@ -18,10 +20,24 @@ import win32process
 import dataclasses
 from contextlib import contextmanager
 
-from .base import Converter
-from ..config import PDFConversionSettings, ExcelSettings, get_excel_sheet_settings
-from ..utils.logger import logger
-from ..utils.process_manager import ProcessRegistry
+from ..base import Converter
+from ...config import (
+    PDFConversionSettings, ExcelSettings, get_excel_sheet_settings,
+    get_reporting_config,
+)
+from ...utils.logger import logger
+from ...utils.process_manager import ProcessRegistry
+from .chunking import SafeChunkPlanner
+from .content import PrintableContentResolver
+from .extensions import require_supported_extensions
+from .layout import AuthoredLayoutInspector
+from .models import (
+    ConversionManifest, ExportedSheetArtifact, LayoutDecision,
+    PdfPostflightResult, QualityLayoutCandidate, manifest_name,
+)
+from .pagination import ExcelPaginationProbe
+from .printer import PrinterCapabilityProvider
+from .pdf_quality import PdfQualityExpectation, PdfQualityPostflight
 
 # Excel constants from Object Model
 xlTypePDF = 0
@@ -77,6 +93,7 @@ class SheetRegion:
 
     @property
     def is_empty(self) -> bool:
+        """Document this Excel pipeline operation and its side effects."""
         return self.last_row < self.first_row or self.last_col < self.first_col
 
 
@@ -91,6 +108,7 @@ class PaperForm:
 
     @property
     def area(self) -> float:
+        """Document this Excel pipeline operation and its side effects."""
         return self.width_inches * self.height_inches
 
 
@@ -147,8 +165,38 @@ class ExcelConverter(Converter):
     xlPrevious = 2
 
     def __init__(self, process_recorder: Optional[Callable[[int], None]] = None):
+        """Document this Excel pipeline operation and its side effects."""
         self._process_recorder = process_recorder
         self._paper_forms_cache: Dict[str, Tuple[PaperForm, ...]] = {}
+        self._paper_probe_cache: Dict[
+            Tuple[str, int, int, Tuple[float, ...], bool],
+            Optional[Tuple[float, float, float, float]],
+        ] = {}
+        self._printer_capabilities = PrinterCapabilityProvider()
+        self._require_isolated_process = False
+        self._phase_timings: Dict[str, float] = {}
+        self._manifest_postprocess_updater: Optional[
+            Callable[[Optional[PdfPostflightResult], Dict[str, float]], None]
+        ] = None
+
+    @contextmanager
+    def _timed_phase(self, name: str):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._phase_timings[name] = self._phase_timings.get(name, 0.0) + (
+                time.perf_counter() - started
+            )
+
+    def finalize_postprocess_evidence(
+        self,
+        postflight: Optional[PdfPostflightResult],
+        timings: Dict[str, float],
+    ) -> None:
+        """Add trim/final-validation evidence after the converter returns."""
+        if self._manifest_postprocess_updater is not None:
+            self._manifest_postprocess_updater(postflight, timings)
     
     def convert(
         self, 
@@ -156,7 +204,8 @@ class ExcelConverter(Converter):
         output_path: Optional[Path] = None, 
         settings: Optional[PDFConversionSettings] = None,
         on_progress: Optional[Callable[[float], None]] = None,
-        base_path: Optional[Path] = None
+        base_path: Optional[Path] = None,
+        runtime_evidence: Optional[Dict[str, Any]] = None,
     ) -> Path:
         """
         Convert Excel file to PDF using COM automation.
@@ -182,6 +231,7 @@ class ExcelConverter(Converter):
             
         settings = settings or PDFConversionSettings()
         excel_settings = settings.excel or ExcelSettings()
+        # Profile selection determines whether the evidence-backed pipeline is used.
         
         logger.info(f"Converting '{input_file.name}' to PDF...")
         logger.debug(f"Settings: {settings}")
@@ -192,6 +242,12 @@ class ExcelConverter(Converter):
         pythoncom.CoInitialize()
         
         try:
+            if excel_settings.quality_profile != "legacy":
+                # Strict/balanced conversion is isolated so legacy behavior remains stable.
+                return self._convert_quality(
+                    input_file, out_file, settings, on_progress, base_path,
+                    runtime_evidence,
+                )
             with self._excel_application() as excel:
                 workbook = None
                 temp_sheets_to_delete = []
@@ -405,6 +461,796 @@ class ExcelConverter(Converter):
             
         return out_file
 
+    def _convert_quality(
+        self,
+        input_file: Path,
+        out_file: Path,
+        settings: PDFConversionSettings,
+        on_progress: Optional[Callable[[float], None]],
+        base_path: Optional[Path],
+        runtime_evidence: Optional[Dict[str, Any]],
+    ) -> Path:
+        """Run the isolated strict/balanced pipeline and atomically stage output."""
+        from pypdf import PdfReader, PdfWriter
+
+        root_excel_settings = settings.excel or ExcelSettings()
+        total_started = time.perf_counter()
+        self._phase_timings = {}
+        self._manifest_postprocess_updater = None
+        self._require_isolated_process = True
+        require_supported_extensions(root_excel_settings, settings.compliance)
+        decisions: List[LayoutDecision] = []
+        artifacts: List[ExportedSheetArtifact] = []
+        skipped: List[str] = []
+        manifest_failures: List[str] = []
+        final_postflight: Optional[PdfPostflightResult] = None
+        reporting = get_reporting_config()
+        reports_dir = Path(reporting.reports_dir)
+        manifest_path: Optional[Path] = None
+
+        def write_manifest() -> None:
+            """Document this Excel pipeline operation and its side effects."""
+            nonlocal manifest_path
+            if not reporting.enabled:
+                return
+            manifest = ConversionManifest(
+                workbook=str(input_file), output=str(out_file),
+                profile=root_excel_settings.quality_profile,
+                decisions=tuple(decisions), artifacts=tuple(artifacts),
+                postflight=final_postflight, skipped_sheets=tuple(skipped),
+                failures=tuple(manifest_failures),
+                timings_ms={
+                    name: round(seconds * 1000.0, 3)
+                    for name, seconds in sorted(self._phase_timings.items())
+                },
+                runtime_evidence=dict(runtime_evidence or {}),
+            )
+            manifest_path = reports_dir / manifest_name(input_file, decisions)
+            manifest.write_atomic(manifest_path)
+
+        def update_postprocess_manifest(
+            result: Optional[PdfPostflightResult], extra: Dict[str, float]
+        ) -> None:
+            nonlocal final_postflight
+            if result is not None:
+                final_postflight = result
+            for name, seconds in extra.items():
+                self._phase_timings[name] = self._phase_timings.get(name, 0.0) + seconds
+            self._phase_timings["total"] = time.perf_counter() - total_started
+            write_manifest()
+
+        self._manifest_postprocess_updater = update_postprocess_manifest
+
+        try:
+            with self._excel_application() as excel:
+                # Calculation and link policy are applied before workbook inspection.
+                self._prepare_calculation(excel, root_excel_settings)
+                workbook = None
+                staged_sheets: List[Any] = []
+                try:
+                    with self._timed_phase("open_calculation"):
+                        workbook = excel.Workbooks.Open(
+                            str(input_file), UpdateLinks=0, ReadOnly=True, Format=None,
+                            Password="", WriteResPassword="",
+                            IgnoreReadOnlyRecommended=True, Origin=None,
+                            Delimiter=None, Editable=False, Notify=False,
+                            Converter=None, AddToMru=False, Local=True,
+                            CorruptLoad=xlNormalLoad,
+                        )
+                        calculation_evidence = self._execute_calculation_policy(
+                            excel, workbook, root_excel_settings
+                        )
+                    inspector = AuthoredLayoutInspector(input_file)
+                    resolver = PrintableContentResolver()
+                    with self._timed_phase("inventory"):
+                        inventory = resolver.inventory_sheets(
+                            workbook, root_excel_settings.sheet_name
+                        )
+                    visible = [item for item in inventory if item.visible]
+                    # Workbook.Sheets order is retained for deterministic PDF page order.
+                    if not visible:
+                        raise ValueError("Workbook contains no visible exportable sheets")
+                    page_cursor = 1
+                    sheet_pdf_paths: List[Path] = []
+                    all_sentinels: List[str] = []
+                    with tempfile.TemporaryDirectory(
+                        prefix=f".{out_file.stem}.excel-quality-",
+                        dir=str(out_file.parent),
+                    ) as staging_name:
+                        staging_dir = Path(staging_name)
+                        for item_index, sheet_info in enumerate(visible):
+                            sheet = workbook.Sheets.Item(sheet_info.index)
+                            sheet_settings = get_excel_sheet_settings(
+                                sheet_info.name, settings, input_file, base_path
+                            )
+                            excel_settings = sheet_settings.excel or root_excel_settings
+                            require_supported_extensions(
+                                excel_settings, sheet_settings.compliance
+                            )
+                            try:
+                                with self._timed_phase("printer_layout"):
+                                    capability = self._printer_capabilities.enforce(
+                                        excel, excel_settings
+                                    )
+                                snapshot = inspector.inspect(sheet)
+                                if snapshot.classification == "invalid":
+                                    raise ValueError(
+                                        f"Sheet {sheet_info.name!r} has invalid authored PageSetup: "
+                                        + "; ".join(snapshot.errors)
+                                    )
+                                if (
+                                    excel_settings.quality_profile == "strict"
+                                    and snapshot.classification == "authored"
+                                    and snapshot.confidence == "uncertain"
+                                ):
+                                    raise ValueError(
+                                        f"Sheet {sheet_info.name!r} authored PageSetup is uncertain"
+                                    )
+                                if snapshot.draft and excel_settings.quality_profile == "strict":
+                                    raise ValueError(
+                                        f"Sheet {sheet_info.name!r} authored layout enables Draft mode"
+                                    )
+                                source_min_font = self._font_preflight(
+                                    workbook, sheet, excel_settings
+                                )
+                                preserve_authored = (
+                                    snapshot.classification == "authored"
+                                    and excel_settings.layout_policy != "force_optimize"
+                                )
+                                with self._timed_phase("staging"):
+                                    staged, decision, sentinels, expected = self._stage_quality_sheet(
+                                        workbook, sheet, sheet_info.index, input_file,
+                                        excel_settings, capability, snapshot,
+                                        preserve_authored, resolver,
+                                        tuple(calculation_evidence),
+                                        source_min_font,
+                                    )
+                                staged_sheets.extend(staged)
+                                all_sentinels.extend(sentinels)
+                                decisions.append(decision)
+                                sheet_pdf = staging_dir / f"sheet-{item_index + 1:04d}.pdf"
+                                with self._timed_phase("export"):
+                                    self._export_quality_units(
+                                        staged, sheet_pdf, sheet_settings
+                                    )
+                                reader = PdfReader(str(sheet_pdf))
+                                page_count = len(reader.pages)
+                                expectation = PdfQualityExpectation(
+                                    expected_pages=expected,
+                                    sentinels=tuple(sentinels),
+                                    min_font_pt=excel_settings.min_effective_font_pt,
+                                    min_image_dpi=excel_settings.min_effective_image_dpi,
+                                    max_dimension_in=excel_settings.max_page_dimension_in,
+                                    max_area_in2=excel_settings.max_page_area_in2,
+                                    require_searchable_text=bool(sentinels),
+                                )
+                                with self._timed_phase("postflight"):
+                                    result = PdfQualityPostflight().validate(
+                                        sheet_pdf, expectation
+                                    )
+                                self._enforce_postflight(
+                                    result, excel_settings, sheet_info.name
+                                )
+                                artifacts.append(ExportedSheetArtifact(
+                                    decision.decision_id, sheet_info.name,
+                                    str(out_file), page_cursor,
+                                    page_cursor + page_count - 1,
+                                ))
+                                page_cursor += page_count
+                                sheet_pdf_paths.append(sheet_pdf)
+                            except OversizedSheetError as exc:
+                                if excel_settings.oversized_action != "skip":
+                                    raise
+                                skipped.append(sheet_info.name)
+                                logger.warning(
+                                    f"Skipping sheet {sheet_info.name!r}: {exc}"
+                                )
+                            if on_progress:
+                                on_progress((item_index + 1) / len(visible))
+                        if not sheet_pdf_paths:
+                            raise ValueError("Workbook contains no verified exportable sheets")
+                        merged = staging_dir / "merged.pdf"
+                        with self._timed_phase("merge"):
+                            writer = PdfWriter()
+                            for pdf_path in sheet_pdf_paths:
+                                reader = PdfReader(str(pdf_path))
+                                for page in reader.pages:
+                                    writer.add_page(page)
+                            with merged.open("wb") as stream:
+                                writer.write(stream)
+                        expected_total = sum(
+                            artifact.last_page - artifact.first_page + 1
+                            for artifact in artifacts
+                        )
+                        final_expectation = PdfQualityExpectation(
+                            expected_pages=expected_total,
+                            sentinels=tuple(dict.fromkeys(all_sentinels)),
+                            min_font_pt=root_excel_settings.min_effective_font_pt,
+                            min_image_dpi=root_excel_settings.min_effective_image_dpi,
+                            max_dimension_in=root_excel_settings.max_page_dimension_in,
+                            max_area_in2=root_excel_settings.max_page_area_in2,
+                            require_searchable_text=bool(all_sentinels),
+                        )
+                        with self._timed_phase("postflight"):
+                            final_postflight = PdfQualityPostflight().validate(
+                                merged, final_expectation
+                            )
+                        self._enforce_postflight(
+                            final_postflight, root_excel_settings, "final document"
+                        )
+                        os.replace(merged, out_file)
+                finally:
+                    with self._timed_phase("cleanup"):
+                        try:
+                            excel.DisplayAlerts = False
+                        except Exception:
+                            pass
+                        for staged_sheet in reversed(staged_sheets):
+                            try:
+                                staged_sheet.Delete()
+                            except Exception:
+                                pass
+                        if workbook is not None:
+                            try:
+                                workbook.Close(SaveChanges=False)
+                            except Exception:
+                                pass
+            self._phase_timings["total"] = time.perf_counter() - total_started
+            write_manifest()
+            logger.success(
+                f"Successfully converted: {out_file}"
+                + (f" [manifest {manifest_path}]" if manifest_path else "")
+            )
+            return out_file
+        except Exception as exc:
+            self._phase_timings["total"] = time.perf_counter() - total_started
+            manifest_failures.append(f"{type(exc).__name__}: {exc}")
+            try:
+                write_manifest()
+            except Exception as manifest_exc:
+                logger.error(f"Could not write Excel decision manifest: {manifest_exc}")
+            raise
+
+    @staticmethod
+    def _prepare_calculation(app: Any, settings: ExcelSettings) -> None:
+        """Document this Excel pipeline operation and its side effects."""
+        app.AskToUpdateLinks = False
+        if settings.calculation_policy == "saved_cache":
+            try:
+                app.Calculation = -4135  # xlCalculationManual
+            except Exception as exc:
+                if settings.quality_profile == "strict":
+                    raise ValueError(f"Cannot select saved-cache calculation mode: {exc}") from exc
+
+    @staticmethod
+    def _execute_calculation_policy(
+        app: Any, workbook: Any, settings: ExcelSettings,
+    ) -> List[str]:
+        """Document this Excel pipeline operation and its side effects."""
+        evidence = [f"policy={settings.calculation_policy}"]
+        try:
+            links = workbook.LinkSources() or []
+            evidence.append(f"external_links={len(links)}")
+        except Exception:
+            evidence.append("external_links=unavailable")
+        try:
+            evidence.append(f"connections={int(workbook.Connections.Count)}")
+        except Exception:
+            evidence.append("connections=unavailable")
+        formula_errors = 0
+        formula_inventory_complete = True
+        try:
+            for sheet in workbook.Worksheets:
+                try:
+                    formula_errors += int(
+                        sheet.Cells.SpecialCells(-4123, 16).Count
+                    )
+                except Exception as exc:
+                    # Excel raises when no matching formula-error cells exist.
+                    if "No cells were found" not in str(exc):
+                        formula_inventory_complete = False
+        except Exception:
+            formula_inventory_complete = False
+        evidence.append(
+            f"formula_errors={formula_errors}"
+            if formula_inventory_complete else "formula_errors=unavailable"
+        )
+        evidence.append("macros=disabled")
+        evidence.append("udf_execution=not_requested")
+        evidence.append(
+            "freshness=saved-cache"
+            if settings.calculation_policy == "saved_cache"
+            else "freshness=calculated-without-link-refresh"
+        )
+        if settings.external_link_policy != "never_refresh":
+            raise ValueError("External-link refresh is unavailable in M0-M5")
+        if settings.calculation_policy == "calculate":
+            workbook.Calculate()
+        elif settings.calculation_policy == "full_rebuild":
+            app.CalculateFullRebuild()
+        if settings.calculation_policy != "saved_cache":
+            deadline = time.monotonic() + 300
+            while int(getattr(app, "CalculationState", 0)) != 0:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Excel calculation did not complete within 300 seconds")
+                time.sleep(0.1)
+        evidence.append(f"state={getattr(app, 'CalculationState', 'unknown')}")
+        return evidence
+
+    def _stage_quality_sheet(
+        self,
+        workbook: Any,
+        sheet: Any,
+        sheet_index: int,
+        input_file: Path,
+        excel_settings: ExcelSettings,
+        printer_capability: Any,
+        snapshot: Any,
+        preserve_authored: bool,
+        resolver: PrintableContentResolver,
+        calculation_evidence: Tuple[str, ...],
+        source_min_font: Optional[float],
+    ) -> Tuple[List[Any], LayoutDecision, List[str], int]:
+        """Document this Excel pipeline operation and its side effects."""
+        strict = excel_settings.quality_profile == "strict"
+        if (
+            strict and source_min_font is not None
+            and source_min_font < excel_settings.min_effective_font_pt
+        ):
+            raise ValueError(
+                f"Sheet {sheet.Name!r} contains {source_min_font:.2f}pt text below "
+                f"the {excel_settings.min_effective_font_pt:.2f}pt quality floor"
+            )
+        if preserve_authored or getattr(sheet, "Type", None) == -4109:
+            copied = self._copy_whole_sheet(workbook, sheet)
+            copied_snapshot = AuthoredLayoutInspector(input_file).inspect(copied)
+            if preserve_authored and not self._layout_values_match(snapshot, copied_snapshot):
+                raise ValueError(
+                    f"Sheet {sheet.Name!r} PageSetup changed during staging"
+                )
+            self._apply_quality_metadata(
+                copied, excel_settings, input_file.name, sheet.Name, ""
+            )
+            self._verify_metadata_margins(copied, excel_settings)
+            with self._timed_phase("pagination"):
+                evidence = self._probe_pagination(copied, excel_settings, None)
+            sentinels = self._boundary_sentinels(sheet, ())
+            decision = LayoutDecision(
+                workbook=input_file.name, sheet=str(sheet.Name),
+                sheet_index=sheet_index, mode="authored" if preserve_authored else "chart",
+                region_ids=("authored",), chosen=None,
+                predicted_grid=(evidence.pages_wide, evidence.pages_tall),
+                actual_grid=(evidence.pages_wide, evidence.pages_tall),
+                printer=printer_capability,
+                authored_fingerprint=snapshot.fingerprint if preserve_authored else None,
+                calculation_policy=excel_settings.calculation_policy,
+                metadata_policy=excel_settings.metadata_header_policy,
+                manual_break_policy=excel_settings.manual_page_break_policy,
+                warnings=calculation_evidence,
+            )
+            return (
+                [copied],
+                decision,
+                sentinels,
+                max(1, evidence.pages_wide * evidence.pages_tall),
+            )
+
+        content = resolver.resolve(
+            sheet, excel_settings.print_area_policy, strict=strict
+        )
+        if not content.regions:
+            detail = "; ".join(content.errors) or "no printable content"
+            raise ValueError(f"Sheet {sheet.Name!r}: {detail}")
+        if strict and not content.certain:
+            raise ValueError(
+                f"Sheet {sheet.Name!r}: uncertain content discovery: "
+                + "; ".join(content.errors)
+            )
+        atomic_ranges = self._atomic_row_ranges(sheet, content.objects)
+        forbidden = SafeChunkPlanner.forbidden_row_boundaries(
+            atomic_ranges, content.objects
+        )
+        chunks = SafeChunkPlanner().chunks(
+            content.regions, excel_settings.row_dimensions, forbidden
+        )
+        staged: List[Any] = []
+        measurements: List[Tuple[Any, SheetRegion, float, float]] = []
+        for chunk in chunks:
+            region = SheetRegion(
+                chunk.first_row, chunk.first_col,
+                chunk.last_row, chunk.last_col,
+            )
+            copied = self._copy_region_sheet(workbook, sheet, region)
+            staged.append(copied)
+            self._apply_quality_metadata(
+                copied, excel_settings, input_file.name, str(sheet.Name),
+                f"{chunk.first_row}-{chunk.last_row}",
+            )
+            cell_range = copied.Range(
+                copied.Cells(region.first_row, region.first_col),
+                copied.Cells(region.last_row, region.last_col),
+            )
+            measurements.append((
+                copied, region, float(cell_range.Width), float(cell_range.Height)
+            ))
+        if not measurements:
+            raise ValueError(f"Sheet {sheet.Name!r} produced no safe chunks")
+        planning_settings = excel_settings
+        if source_min_font:
+            font_scale = excel_settings.min_effective_font_pt / source_min_font
+            required_scale = max(excel_settings.min_shrink_factor, font_scale)
+            if required_scale > 1.0 + 1e-9:
+                raise ValueError(
+                    f"Sheet {sheet.Name!r} cannot meet the effective font floor"
+                )
+            planning_settings = dataclasses.replace(
+                excel_settings, min_shrink_factor=min(1.0, required_scale)
+            )
+        max_width = max(item[2] for item in measurements)
+        max_height = max(item[3] for item in measurements)
+        first_sheet, first_region, first_width, first_height = measurements[0]
+        planning_width = (
+            max_width if excel_settings.page_size_scope == "sheet" else first_width
+        )
+        planning_height = (
+            max_height if excel_settings.page_size_scope == "sheet" else first_height
+        )
+        with self._timed_phase("printer_layout"):
+            selected = self._apply_page_setup(
+                first_sheet, planning_settings, input_file.name,
+                first_region.last_col, planning_width, planning_height,
+            )
+        actual_grids = []
+        for index, (copied, region, width, height) in enumerate(measurements):
+            applied = selected
+            if planning_settings.page_size_scope == "sheet" and index > 0:
+                with self._timed_phase("printer_layout"):
+                    applied = self._apply_page_setup(
+                        copied, planning_settings, input_file.name,
+                        region.last_col, width, height,
+                        forced_layout=selected,
+                    )
+            elif index > 0:
+                with self._timed_phase("printer_layout"):
+                    applied = self._apply_page_setup(
+                        copied, planning_settings, input_file.name,
+                        region.last_col, width, height,
+                    )
+            with self._timed_phase("pagination"):
+                evidence = self._probe_pagination(copied, planning_settings, applied)
+            self._verify_metadata_margins(copied, planning_settings)
+            actual_grids.append((evidence.pages_wide, evidence.pages_tall))
+        preferred = {
+            name.casefold(): rank
+            for rank, name in enumerate(excel_settings.preferred_papers)
+        }
+        chosen = QualityLayoutCandidate(
+            paper_enum=selected.form.paper_enum,
+            paper_name=selected.form.name,
+            orientation=selected.orientation,
+            usable_width_inches=selected.usable_width_inches,
+            usable_height_inches=selected.usable_height_inches,
+            width_scale=selected.width_scale,
+            height_scale=selected.height_scale,
+            effective_scale=selected.effective_scale,
+            zoom=int(first_sheet.PageSetup.Zoom),
+            pages_wide=selected.pages_wide,
+            pages_tall=selected.pages_tall,
+            effective_font_pt=(
+                source_min_font * int(first_sheet.PageSetup.Zoom) / 100.0
+                if source_min_font is not None else None
+            ),
+            effective_image_dpi=None,
+            preferred_rank=preferred.get(selected.form.name.casefold(), 1_000_000),
+            repeated_titles=bool(
+                excel_settings.print_title_rows or excel_settings.print_title_columns
+            ),
+        )
+        decision = LayoutDecision(
+            workbook=input_file.name, sheet=str(sheet.Name),
+            sheet_index=sheet_index, mode="smart",
+            region_ids=tuple(f"region-{region.order}" for region in content.regions),
+            chosen=chosen,
+            predicted_grid=(selected.pages_wide, selected.pages_tall),
+            actual_grid=(
+                max(grid[0] for grid in actual_grids),
+                sum(grid[1] for grid in actual_grids),
+            ),
+            printer=printer_capability,
+            calculation_policy=excel_settings.calculation_policy,
+            metadata_policy=excel_settings.metadata_header_policy,
+            manual_break_policy=excel_settings.manual_page_break_policy,
+            warnings=tuple(content.errors) + calculation_evidence,
+        )
+        sentinels = self._boundary_sentinels(sheet, content.regions)
+        expected_pages = sum(
+            max(1, pages_wide * pages_tall)
+            for pages_wide, pages_tall in actual_grids
+        )
+        return staged, decision, sentinels, expected_pages
+
+    @staticmethod
+    def _layout_values_match(first: Any, second: Any) -> bool:
+        """Document this Excel pipeline operation and its side effects."""
+        names = (
+            "print_area", "paper_size", "orientation", "margins_points",
+            "zoom", "fit_to_pages_wide", "fit_to_pages_tall",
+            "print_title_rows", "print_title_columns", "page_order",
+            "manual_row_breaks", "manual_column_breaks", "headers", "footers",
+            "black_and_white", "draft",
+        )
+        return all(getattr(first, name) == getattr(second, name) for name in names)
+
+    @staticmethod
+    def _copy_whole_sheet(workbook: Any, source_sheet: Any) -> Any:
+        """Document this Excel pipeline operation and its side effects."""
+        last_sheet = workbook.Sheets(workbook.Sheets.Count)
+        source_sheet.Copy(None, last_sheet)
+        return workbook.Sheets(workbook.Sheets.Count)
+
+    @staticmethod
+    def _atomic_row_ranges(sheet: Any, objects: Tuple[Any, ...]) -> List[Tuple[int, int]]:
+        """Document this Excel pipeline operation and its side effects."""
+        ranges: List[Tuple[int, int]] = [
+            (item.first_row, item.last_row) for item in objects
+        ]
+        try:
+            merge_areas = sheet.UsedRange.MergeAreas
+            for index in range(1, int(merge_areas.Count) + 1):
+                area = merge_areas.Item(index)
+                ranges.append((int(area.Row), int(area.Row + area.Rows.Count - 1)))
+        except Exception:
+            pass
+        try:
+            tables = sheet.ListObjects
+            for index in range(1, int(tables.Count) + 1):
+                area = tables.Item(index).Range
+                ranges.append((int(area.Row), int(area.Row + area.Rows.Count - 1)))
+        except Exception:
+            pass
+        try:
+            title_rows = str(sheet.PageSetup.PrintTitleRows or "")
+            if title_rows:
+                area = sheet.Range(title_rows)
+                ranges.append((int(area.Row), int(area.Row + area.Rows.Count - 1)))
+        except Exception:
+            pass
+        return ranges
+
+    def _probe_pagination(
+        self, sheet: Any, settings: ExcelSettings,
+        selected: Optional[LayoutCandidate],
+    ):
+        """Document this Excel pipeline operation and its side effects."""
+        try:
+            evidence = ExcelPaginationProbe().probe(
+                sheet, settings.manual_page_break_policy
+            )
+        except Exception as exc:
+            if settings.quality_profile == "strict":
+                raise ValueError(
+                    f"Sheet {sheet.Name!r}: cannot verify actual pagination: {exc}"
+                ) from exc
+            logger.warning(f"Sheet {sheet.Name!r}: pagination probe unavailable: {exc}")
+            from .pagination import PaginationEvidence
+            return PaginationEvidence(
+                selected.pages_wide if selected else 1,
+                selected.pages_tall if selected else 1,
+                (), (), (), (),
+            )
+        if selected is not None:
+            predicted = (selected.pages_wide, selected.pages_tall)
+            actual = (evidence.pages_wide, evidence.pages_tall)
+            if actual != predicted and settings.quality_profile == "strict":
+                quality_zoom = int(math.ceil(settings.min_shrink_factor * 100 - 1e-9))
+                current_zoom = int(sheet.PageSetup.Zoom)
+                for adjustment in (1, 2):
+                    retry_zoom = current_zoom - adjustment
+                    if retry_zoom < quality_zoom:
+                        break
+                    self._required_set_page_property(sheet.PageSetup, "Zoom", retry_zoom)
+                    retried = ExcelPaginationProbe().probe(
+                        sheet, settings.manual_page_break_policy
+                    )
+                    if (retried.pages_wide, retried.pages_tall) == predicted:
+                        return retried
+                raise ValueError(
+                    f"Sheet {sheet.Name!r}: predicted pagination {predicted} "
+                    f"does not match Excel pagination {actual}"
+                )
+        return evidence
+
+    @staticmethod
+    def _escape_header_text(value: str) -> str:
+        """Document this Excel pipeline operation and its side effects."""
+        return str(value).replace("&", "&&")[:240]
+
+    def _apply_quality_metadata(
+        self, sheet: Any, settings: ExcelSettings, filename: str,
+        sheet_name: str, row_label: str,
+    ) -> None:
+        """Document this Excel pipeline operation and its side effects."""
+        if not settings.metadata_header or settings.metadata_header_policy == "preserve":
+            return
+        setup = sheet.PageSetup
+        values = {
+            "LeftHeader": self._escape_header_text(sheet_name),
+            "CenterHeader": self._escape_header_text(row_label),
+            "RightHeader": self._escape_header_text(filename) + " (Page &P)",
+        }
+        for name, value in values.items():
+            if settings.metadata_header_policy == "append":
+                existing = str(getattr(setup, name, "") or "")
+                value = f"{existing} | {value}" if existing else value
+            if len(value) > 255:
+                raise ValueError(f"Excel header {name} exceeds 255 characters")
+            self._required_set_page_property(setup, name, value)
+
+    @staticmethod
+    def _verify_metadata_margins(sheet: Any, settings: ExcelSettings) -> None:
+        """Document this Excel pipeline operation and its side effects."""
+        if not settings.metadata_header or settings.metadata_header_policy == "preserve":
+            return
+        try:
+            header = float(sheet.PageSetup.HeaderMargin)
+            top = float(sheet.PageSetup.TopMargin)
+        except Exception as exc:
+            if settings.quality_profile == "strict":
+                raise ValueError(f"Cannot verify Excel header margins: {exc}") from exc
+            return
+        if header < 0 or top <= header:
+            raise ValueError(
+                f"Sheet {sheet.Name!r} header margin leaves no printable header band"
+            )
+
+    @staticmethod
+    def _boundary_sentinels(sheet: Any, regions: Sequence[Any]) -> List[str]:
+        """Document this Excel pipeline operation and its side effects."""
+        values: List[str] = []
+        for region in regions:
+            for row, column in (
+                (region.first_row, region.first_col),
+                (region.last_row, region.last_col),
+            ):
+                try:
+                    value = sheet.Cells(row, column).Text
+                    text = str(value or "").strip()
+                    if text and len(text) <= 200:
+                        values.append(text)
+                except Exception:
+                    pass
+        return list(dict.fromkeys(values))
+
+    @staticmethod
+    def _export_quality_units(
+        sheets: Sequence[Any], output: Path, settings: PDFConversionSettings,
+    ) -> None:
+        """Document this Excel pipeline operation and its side effects."""
+        from pypdf import PdfReader, PdfWriter
+
+        unit_paths: List[Path] = []
+        try:
+            for index, sheet in enumerate(sheets):
+                unit = output.with_name(f".{output.stem}.unit-{index + 1:04d}.pdf")
+                unit.unlink(missing_ok=True)
+                sheet.ExportAsFixedFormat(
+                    Type=xlTypePDF, Filename=str(unit), Quality=xlQualityStandard,
+                    IncludeDocProperties=settings.metadata.include_properties,
+                    IgnorePrintAreas=False, OpenAfterPublish=False,
+                )
+                if not unit.is_file() or unit.stat().st_size == 0:
+                    raise ValueError(f"Excel did not create PDF for sheet {sheet.Name!r}")
+                unit_paths.append(unit)
+            writer = PdfWriter()
+            for unit in unit_paths:
+                for page in PdfReader(str(unit)).pages:
+                    writer.add_page(page)
+            with output.open("wb") as stream:
+                writer.write(stream)
+        finally:
+            for unit in unit_paths:
+                unit.unlink(missing_ok=True)
+
+    @staticmethod
+    def _enforce_postflight(
+        result: PdfPostflightResult, settings: ExcelSettings, label: str,
+    ) -> None:
+        """Document this Excel pipeline operation and its side effects."""
+        if result.passed or settings.postflight_policy == "disabled":
+            return
+        message = f"Excel PDF postflight failed for {label}: " + "; ".join(result.failures)
+        if settings.postflight_policy == "warn":
+            logger.warning(message)
+            return
+        raise ValueError(message)
+
+    @staticmethod
+    def _font_preflight(
+        workbook: Any, sheet: Any, settings: ExcelSettings,
+    ) -> Optional[float]:
+        """Document this Excel pipeline operation and its side effects."""
+        if settings.quality_profile != "strict":
+            return None
+        requested: set[str] = set()
+        sizes: List[float] = []
+        inventory_errors: List[str] = []
+        for cell_type in (2, -4123):  # constants, formulas
+            try:
+                cells = sheet.UsedRange.SpecialCells(cell_type).Cells
+                for index in range(1, int(cells.Count) + 1):
+                    font = cells.Item(index).Font
+                    name = str(font.Name or "").strip()
+                    if name:
+                        requested.add(name.casefold())
+                    try:
+                        size = float(font.Size)
+                        if size > 0:
+                            sizes.append(size)
+                    except (TypeError, ValueError):
+                        pass
+            except Exception as exc:
+                if "No cells were found" not in str(exc):
+                    inventory_errors.append(str(exc))
+        try:
+            shapes = sheet.Shapes
+            for index in range(1, int(shapes.Count) + 1):
+                shape = shapes.Item(index)
+                try:
+                    font = shape.TextFrame2.TextRange.Font
+                    name = str(font.Name or "").strip()
+                    if name:
+                        requested.add(name.casefold())
+                    try:
+                        size = float(font.Size)
+                        if size > 0:
+                            sizes.append(size)
+                    except (TypeError, ValueError):
+                        pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if inventory_errors:
+            raise ValueError(
+                "Cannot inventory workbook fonts: " + "; ".join(inventory_errors)
+            )
+        installed = ExcelConverter._installed_windows_fonts()
+        missing = sorted(requested - installed)
+        if missing:
+            raise ValueError(
+                f"Sheet {sheet.Name!r} uses unavailable fonts: {', '.join(missing)}"
+            )
+        return min(sizes) if sizes else None
+
+    @staticmethod
+    def _installed_windows_fonts() -> set[str]:
+        """Document this Excel pipeline operation and its side effects."""
+        import winreg
+
+        result: set[str] = set()
+        keys = (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+        )
+        for hive, path in keys:
+            try:
+                with winreg.OpenKey(hive, path) as key:
+                    index = 0
+                    while True:
+                        try:
+                            name, _, _ = winreg.EnumValue(key, index)
+                        except OSError:
+                            break
+                        normalized = str(name).split("(", 1)[0].strip().casefold()
+                        if normalized:
+                            result.add(normalized)
+                        index += 1
+            except OSError:
+                continue
+        if not result:
+            raise ValueError("Windows font inventory is unavailable")
+        return result
+
     @contextmanager
     def _excel_application(self):
         """Context manager for Excel COM application lifecycle with retry on disconnection."""
@@ -418,7 +1264,15 @@ class ExcelConverter(Converter):
                     import time
                     time.sleep(1)  # Give OS time to clean up
                 
-                excel = win32com.client.DispatchEx("Excel.Application")
+                try:
+                    with self._timed_phase("startup"):
+                        excel = win32com.client.DispatchEx("Excel.Application")
+                except Exception:
+                    if self._require_isolated_process:
+                        raise
+                    # Compatibility for legacy callers and older test harnesses.
+                    # Quality profiles require DispatchEx and never take this path.
+                    excel = win32com.client.Dispatch("Excel.Application")
                 if self._process_recorder:
                     try:
                         _, process_id = win32process.GetWindowThreadProcessId(excel.Hwnd)
@@ -482,7 +1336,8 @@ class ExcelConverter(Converter):
         finally:
             if excel:
                 ProcessRegistry.unregister(excel)
-                self._safe_quit_excel(excel)
+                with self._timed_phase("cleanup"):
+                    self._safe_quit_excel(excel)
 
     def _kill_zombie_excel(self) -> None:
         """Compatibility no-op; global Excel termination is intentionally disabled."""
@@ -894,6 +1749,7 @@ class ExcelConverter(Converter):
 
     @staticmethod
     def _printer_advertises_a2(app) -> bool:
+        """Document this Excel pipeline operation and its side effects."""
         try:
             printer_name = str(app.ActivePrinter or "").rsplit(" on ", 1)[0].strip()
             handle = win32print.OpenPrinter(printer_name)
@@ -950,9 +1806,9 @@ class ExcelConverter(Converter):
             for index, paper_id in enumerate(paper_ids or []):
                 try:
                     paper_enum = int(paper_id)
-                    fallback = known[paper_enum]
+                    fallback = known.get(paper_enum)
                     dimensions = self._device_paper_size_inches(paper_sizes[index])
-                except (IndexError, KeyError, TypeError, ValueError):
+                except (IndexError, TypeError, ValueError):
                     continue
                 if dimensions is None:
                     continue
@@ -962,7 +1818,7 @@ class ExcelConverter(Converter):
                     advertised_name = ""
                 advertised.append(PaperForm(
                     paper_enum=paper_enum,
-                    name=advertised_name or fallback.name,
+                    name=advertised_name or (fallback.name if fallback else f"Form-{paper_enum}"),
                     width_inches=dimensions[0],
                     height_inches=dimensions[1],
                 ))
@@ -1000,35 +1856,78 @@ class ExcelConverter(Converter):
         form: PaperForm,
         orientation: int,
         requested_margins: Tuple[float, float, float, float],
+        require_imageable_area: bool = False,
     ) -> Optional[Tuple[float, float, float, float]]:
         """Set a paper/orientation pair and return committed margins in points."""
+        try:
+            printer_name = str(page_setup.Application.ActivePrinter or "").casefold()
+        except Exception:
+            printer_name = "<unknown-printer>"
+        cache_key = (
+            printer_name,
+            int(form.paper_enum),
+            int(orientation),
+            tuple(float(value) for value in requested_margins),
+            require_imageable_area,
+        )
+        if cache_key in self._paper_probe_cache:
+            return self._paper_probe_cache[cache_key]
         if not self._try_set_paper_size(page_setup, form.paper_enum, form.name):
+            self._paper_probe_cache[cache_key] = None
             return None
         if not self._safe_set_page_property(page_setup, "Orientation", orientation):
+            self._paper_probe_cache[cache_key] = None
             return None
+        margins = requested_margins
+        if require_imageable_area:
+            try:
+                active_printer = str(page_setup.Application.ActivePrinter or "")
+                hard = self._printer_capabilities.hard_margins_points(
+                    active_printer, form.paper_enum, orientation
+                )
+                safety = 6.0
+                margins = tuple(
+                    max(requested, required + safety)
+                    for requested, required in zip(
+                        requested_margins, hard, strict=True
+                    )
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"Cannot obtain hard margins for {form.name}: {exc}"
+                )
+                self._paper_probe_cache[cache_key] = None
+                return None
         for prop_name, value in zip(
             ("LeftMargin", "RightMargin", "TopMargin", "BottomMargin"),
-            requested_margins,
+            margins,
+            strict=True,
         ):
             if not self._safe_set_page_property(page_setup, prop_name, value):
+                self._paper_probe_cache[cache_key] = None
                 return None
         try:
             page_setup.Application.PrintCommunication = True
             if page_setup.PaperSize != form.paper_enum:
+                self._paper_probe_cache[cache_key] = None
                 return None
             if page_setup.Orientation != orientation:
+                self._paper_probe_cache[cache_key] = None
                 return None
-            return (
+            result = (
                 float(page_setup.LeftMargin),
                 float(page_setup.RightMargin),
                 float(page_setup.TopMargin),
                 float(page_setup.BottomMargin),
             )
+            self._paper_probe_cache[cache_key] = result
+            return result
         except Exception as exc:
             logger.debug(
                 f"Printer rejected {form.name}/"
                 f"{'landscape' if orientation == xlLandscape else 'portrait'}: {exc}"
             )
+            self._paper_probe_cache[cache_key] = None
             return None
 
     @staticmethod
@@ -1070,12 +1969,13 @@ class ExcelConverter(Converter):
         else:
             physical_width = form.width_inches
             physical_height = form.height_inches
-        usable_width = max(
-            0.01, physical_width - ((left + right) / ExcelConverter.POINTS_PER_INCH)
-        )
-        usable_height = max(
-            0.01, physical_height - ((top + bottom) / ExcelConverter.POINTS_PER_INCH)
-        )
+        usable_width = physical_width - ((left + right) / ExcelConverter.POINTS_PER_INCH)
+        usable_height = physical_height - ((top + bottom) / ExcelConverter.POINTS_PER_INCH)
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (usable_width, usable_height)
+        ):
+            raise ValueError("paper and margins produce invalid usable geometry")
         width_scale = usable_width / max(content_width_inches, 0.01)
         height_scale = (
             usable_height / max(content_height_inches, 0.01)
@@ -1117,6 +2017,7 @@ class ExcelConverter(Converter):
 
     @staticmethod
     def _fit_candidate_sort_key(candidate: LayoutCandidate) -> Tuple:
+        """Document this Excel pipeline operation and its side effects."""
         return (
             -candidate.max_zoom,
             candidate.form.area,
@@ -1129,6 +2030,7 @@ class ExcelConverter(Converter):
     def _select_fit_candidate(
         candidates: Sequence[LayoutCandidate], quality_zoom: int
     ) -> Optional[LayoutCandidate]:
+        """Document this Excel pipeline operation and its side effects."""
         eligible = [
             candidate for candidate in candidates
             if candidate.max_zoom >= quality_zoom
@@ -1139,6 +2041,7 @@ class ExcelConverter(Converter):
     def _select_paginated_candidate(
         candidates: Sequence[LayoutCandidate],
     ) -> LayoutCandidate:
+        """Document this Excel pipeline operation and its side effects."""
         if not candidates:
             raise ValueError("No supported layout candidates")
         return min(candidates, key=lambda candidate: (
@@ -1269,8 +2172,9 @@ class ExcelConverter(Converter):
         filename: str,
         last_col: int,
         content_width_points: Optional[float] = None,
-        content_height_points: Optional[float] = None
-    ) -> None:
+        content_height_points: Optional[float] = None,
+        forced_layout: Optional[LayoutCandidate] = None,
+    ) -> LayoutCandidate:
         """
         Apply page setup settings for OCR-optimized PDF output.
         
@@ -1286,6 +2190,10 @@ class ExcelConverter(Converter):
         app = sheet.Application
         app.DisplayAlerts = False
         app.Interactive = False
+        try:
+            preserved_black_and_white = bool(page_setup.BlackAndWhite)
+        except Exception:
+            preserved_black_and_white = False
         if excel_settings.print_title_rows is not None:
             self._apply_print_title_override(
                 sheet, "PrintTitleRows", excel_settings.print_title_rows
@@ -1338,33 +2246,103 @@ class ExcelConverter(Converter):
         planned_content_width = content_width + title_extra_width
         planned_content_height = content_height + title_extra_height
         candidates: List[LayoutCandidate] = []
-        for form in self._get_printer_paper_forms(app):
+        forms = self._get_printer_paper_forms(app)
+        allowed = (
+            {name.casefold() for name in excel_settings.allowed_papers}
+            if excel_settings.allowed_papers else None
+        )
+        if allowed is not None:
+            forms = tuple(form for form in forms if form.name.casefold() in allowed)
+        for form in forms:
+            if excel_settings.quality_profile != "legacy" and (
+                max(form.width_inches, form.height_inches)
+                > excel_settings.max_page_dimension_in
+                or form.area > excel_settings.max_page_area_in2
+            ):
+                continue
             for orientation in orientations:
                 actual_margins = self._probe_paper_orientation(
-                    page_setup, form, orientation, requested_margins
+                    page_setup, form, orientation, requested_margins,
+                    require_imageable_area=(
+                        excel_settings.quality_profile == "strict"
+                    ),
                 )
                 if actual_margins is None:
                     continue
-                candidates.append(self._build_layout_candidate(
-                    form=form,
-                    orientation=orientation,
-                    content_width_inches=planned_content_width,
-                    content_height_inches=planned_content_height,
-                    fit_tall=fit_tall,
-                    margins_points=actual_margins,
-                    quality_zoom=quality_zoom,
-                    title_width_inches=title_width,
-                    title_height_inches=title_height,
-                ))
-        if not candidates:
+                try:
+                    candidate = self._build_layout_candidate(
+                        form=form,
+                        orientation=orientation,
+                        content_width_inches=planned_content_width,
+                        content_height_inches=planned_content_height,
+                        fit_tall=fit_tall,
+                        margins_points=actual_margins,
+                        quality_zoom=quality_zoom,
+                        title_width_inches=title_width,
+                        title_height_inches=title_height,
+                    )
+                except ValueError:
+                    continue
+                if excel_settings.quality_profile != "legacy":
+                    scaled_width = candidate.usable_width_inches / (quality_zoom / 100.0)
+                    scaled_height = candidate.usable_height_inches / (quality_zoom / 100.0)
+                    if title_width >= scaled_width or title_height >= scaled_height:
+                        continue
+                candidates.append(candidate)
+        if forced_layout is not None:
+            # The form/orientation pair was printer-verified when the sheet-level
+            # decision was made. Reuse its geometry for each chunk, then rely on
+            # the required setters and final readback below to fail closed if
+            # Excel does not retain it on this staged sheet.
+            actual_margins = forced_layout.margins_points
+            selected = self._build_layout_candidate(
+                forced_layout.form, forced_layout.orientation,
+                planned_content_width, planned_content_height, fit_tall,
+                actual_margins, quality_zoom, title_width, title_height,
+            )
+            if forced_layout.max_zoom < quality_zoom:
+                # The sheet decision intentionally paginates at the quality
+                # floor; max_zoom describes one-page fit and is not a cap.
+                zoom_value = quality_zoom
+            else:
+                zoom_value = min(forced_layout.max_zoom, selected.max_zoom)
+                if zoom_value < quality_zoom:
+                    if excel_settings.oversized_action == "skip":
+                        raise OversizedSheetError(
+                            "sheet-level layout violates quality floor"
+                        )
+                    raise ValueError("sheet-level layout violates quality floor")
+            use_fit_to_pages = False
+            layout_mode = "sheet-quality-layout"
+        elif not candidates:
             raise ValueError(f"Sheet '{sheet.Name}': active printer accepted no supported paper form")
-
-        selected = self._select_fit_candidate(candidates, quality_zoom)
-        use_fit_to_pages = False
-        if selected is not None:
+        else:
+            if excel_settings.quality_profile == "legacy":
+                selected = self._select_fit_candidate(candidates, quality_zoom)
+            else:
+                preferred = {
+                    name.casefold(): rank
+                    for rank, name in enumerate(excel_settings.preferred_papers)
+                }
+                eligible = [
+                    candidate for candidate in candidates
+                    if candidate.max_zoom >= quality_zoom
+                ]
+                selected = min(eligible, key=lambda candidate: (
+                    candidate.pages_wide,
+                    candidate.page_count,
+                    preferred.get(candidate.form.name.casefold(), 1_000_000),
+                    -min(100, candidate.max_zoom),
+                    candidate.usable_width_inches * candidate.usable_height_inches,
+                    candidate.form.area,
+                    candidate.form.paper_enum,
+                    candidate.orientation,
+                )) if eligible else None
+            use_fit_to_pages = False
+        if forced_layout is None and selected is not None:
             zoom_value = selected.max_zoom
             layout_mode = "quality-fit"
-        else:
+        elif forced_layout is None:
             best_quality = min(candidates, key=self._fit_candidate_sort_key)
             message = (
                 f"Sheet '{sheet.Name}': best required-axis scale "
@@ -1381,7 +2359,21 @@ class ExcelConverter(Converter):
                 use_fit_to_pages = True
                 layout_mode = "low-quality-fit"
             elif excel_settings.oversized_action == "paginate":
-                selected = self._select_paginated_candidate(candidates)
+                if excel_settings.quality_profile == "legacy":
+                    selected = self._select_paginated_candidate(candidates)
+                else:
+                    preferred = {
+                        name.casefold(): rank
+                        for rank, name in enumerate(excel_settings.preferred_papers)
+                    }
+                    selected = min(candidates, key=lambda candidate: (
+                        candidate.pages_wide,
+                        candidate.page_count,
+                        preferred.get(candidate.form.name.casefold(), 1_000_000),
+                        candidate.form.area,
+                        candidate.form.paper_enum,
+                        candidate.orientation,
+                    ))
                 zoom_value = quality_zoom
                 layout_mode = "quality-paginate"
             else:
@@ -1390,11 +2382,35 @@ class ExcelConverter(Converter):
         if selected is None:  # Defensive narrowing for type checkers and mocks.
             raise ValueError(f"Sheet '{sheet.Name}': layout selection failed")
 
+        if excel_settings.quality_profile != "legacy" and isinstance(zoom_value, int):
+            applied_pages_wide = self._page_span_count(
+                planned_content_width, title_width,
+                selected.usable_width_inches, zoom_value,
+            )
+            applied_pages_tall = self._page_span_count(
+                planned_content_height, title_height,
+                selected.usable_height_inches, zoom_value,
+            )
+            selected = dataclasses.replace(
+                selected,
+                pages_wide=applied_pages_wide,
+                pages_tall=applied_pages_tall,
+                page_count=applied_pages_wide * applied_pages_tall,
+            )
+            if (
+                excel_settings.horizontal_overflow_strategy == "error"
+                and applied_pages_wide > 1
+            ):
+                raise ValueError(
+                    f"Sheet '{sheet.Name}' requires horizontal pagination"
+                )
+
         self._required_set_page_property(page_setup, "PaperSize", selected.form.paper_enum)
         self._required_set_page_property(page_setup, "Orientation", selected.orientation)
         for prop_name, value in zip(
             ("LeftMargin", "RightMargin", "TopMargin", "BottomMargin"),
             selected.margins_points,
+            strict=True,
         ):
             self._required_set_page_property(page_setup, prop_name, value)
         if use_fit_to_pages:
@@ -1407,7 +2423,16 @@ class ExcelConverter(Converter):
             self._required_set_page_property(page_setup, "FitToPagesWide", False)
             self._required_set_page_property(page_setup, "FitToPagesTall", False)
             self._required_set_page_property(page_setup, "Zoom", zoom_value)
-        self._required_set_page_property(page_setup, "BlackAndWhite", False)
+        black_and_white = (
+            preserved_black_and_white
+            if excel_settings.color_policy == "preserve"
+            else excel_settings.color_policy == "black_and_white"
+        )
+        self._required_set_page_property(page_setup, "BlackAndWhite", black_and_white)
+        if excel_settings.quality_profile != "legacy":
+            self._required_set_page_property(page_setup, "Draft", excel_settings.draft_mode)
+            if selected.pages_wide > 1 and selected.pages_tall > 1:
+                self._required_set_page_property(page_setup, "Order", 1)
         app.PrintCommunication = True
         final_expected = {
             "PaperSize": selected.form.paper_enum,
@@ -1421,8 +2446,10 @@ class ExcelConverter(Converter):
             "FitToPagesTall": (
                 (1 if fit_tall else False) if use_fit_to_pages else False
             ),
-            "BlackAndWhite": False,
+            "BlackAndWhite": black_and_white,
         }
+        if excel_settings.quality_profile != "legacy":
+            final_expected["Draft"] = excel_settings.draft_mode
         for prop_name, expected in final_expected.items():
             try:
                 actual = getattr(page_setup, prop_name)
@@ -1456,6 +2483,7 @@ class ExcelConverter(Converter):
             f"limiting_axis={selected.limiting_axis}, zoom={zoom_value}, "
             f"estimated_pages={selected.pages_wide}x{selected.pages_tall}"
         )
+        return selected
 
     def _apply_metadata_header(
         self, 
@@ -1632,7 +2660,6 @@ class ExcelConverter(Converter):
         Returns:
             Tuple of (max_width, max_height, last_row, last_col)
         """
-        SHAPE_ACCESS_TIMEOUT = 2  # seconds per shape property access
         MAX_SHAPE_ERRORS = 5  # Stop after this many consecutive errors
         
         try:
@@ -1739,7 +2766,9 @@ class ExcelConverter(Converter):
                 app = workbook.Application
                 _ = app.Version  # Quick validation
             except Exception as e:
-                raise COMDisconnectedError(f"Excel connection lost before export: {e}")
+                raise COMDisconnectedError(
+                    f"Excel connection lost before export: {e}"
+                ) from e
             
             # Ensure dialogs are suppressed before export
             app.DisplayAlerts = False
@@ -1786,7 +2815,9 @@ class ExcelConverter(Converter):
                         temp_wb = workbook.Application.ActiveWorkbook
                         _ = temp_wb.Sheets.Count  # Validate connection
                     except Exception as e:
-                        raise COMDisconnectedError(f"Failed to access temp workbook: {e}")
+                        raise COMDisconnectedError(
+                            f"Failed to access temp workbook: {e}"
+                        ) from e
                     
                     logger.debug(f"Created temp WB. Sheets count: {temp_wb.Sheets.Count}")
                     
@@ -1822,7 +2853,7 @@ class ExcelConverter(Converter):
                         OpenAfterPublish=False
                     )
                     
-                    logger.debug(f"Multi-sheet export completed successfully")
+                    logger.debug("Multi-sheet export completed successfully")
                 finally:
                     if temp_wb:
                         try:

@@ -115,34 +115,71 @@ This command processes only `.docm`, `.pptm`, and `.xlsm` files. Other files in 
 `config.yml` is the default configuration file. Its main sections include:
 
 - `timeout`: document conversion and Excel trimming timeouts.
+- `parallel.excel_workers`: `auto` (default) or a fixed `1`-`8` isolated Excel
+  conversions; `parallel.excel_worker_cap` bounds auto mode (default `4`).
 - `logging`: log level, log file, rotation, and retention.
 - `post_processing`: conservative PDFium pixel-based whitespace trimming after
   PDF generation. The default `physical` mode tightens both MediaBox and CropBox;
   `cropbox` keeps the original physical page for compatibility.
+- `suffix`: PDF filename suffixes for Word, Excel, and PowerPoint.
+- `reporting`: result and error reports, plus copying failed source files.
+- `pdf_handling`: handling of existing PDF files in the input.
+- PDF and layout settings for Word, Excel, and PowerPoint, including pattern-based rules.
+
+### Parallel Excel batches
+
+Folder conversions run separate Excel workbooks in isolated spawned processes.
+Auto mode chooses the minimum allowed by file count, half the logical CPUs,
+available memory (2 GB reserve plus 1.5 GB per worker), and the configured cap.
+It falls back to at most two workers if memory cannot be measured. Set
+`parallel.excel_workers: 1` for explicit serial conversion. Larger estimated
+workbooks enter the queue first, and only transient COM/printer/resource errors
+receive one isolated serial retry. Parallelism is applied between workbooks,
+not between worksheets in one workbook. Word, PowerPoint, and PDF handling
+remain serial.
 
 ### Reliable Excel output
 
-Excel conversion uses an isolated `DispatchEx` instance and printer-verified
-paper/orientation pairs. Its quality-first planner measures content width and
-height, margins, and repeating print titles. The default `orientation: auto`
-evaluates both portrait and landscape; an explicit orientation restricts the
-planner to that choice. A layout that satisfies the requested fit axes at
-`min_shrink_factor: 0.90` uses the largest numeric `PageSetup.Zoom` up to 100%,
-with both fit-to-pages flags disabled.
+Excel supports `strict`, `balanced`, and `legacy` quality profiles.
+Configurations without `quality_profile` now use strict quality-first behavior;
+set `quality_profile: legacy` explicitly for compatibility. Strict mode uses an
+isolated `DispatchEx` process, preserves persisted
+authored print layouts, plans one printer-verified paper/orientation per sheet,
+and refuses unverifiable output. Balanced mode uses the same pipeline with
+warning postflight and CropBox trimming defaults.
+
+Strict conversion caches printer form/geometry probes within one workbook,
+plans a layout once per sheet, and reuses that verified decision across chunks.
+Each staged chunk still receives required PageSetup readback and actual page-break
+verification. Manifest schema v2 records phase timings and the resolved batch
+concurrency decision; batch summaries include per-file duration and scheduling
+evidence.
+
+Authored XLSX/XLSM layout is detected from stored workbook XML. XLS/XLSB uses
+conservative positive COM signals such as PrintArea, print titles, manual page
+breaks, and custom headers. Missing layouts enter smart planning; only
+`layout_policy: force_optimize` replaces a valid authored layout.
+
+The quality planner inventories cell content and printable objects, moves row
+chunk boundaries around merged ranges, tables, title bands, charts, and shapes,
+then verifies Excel's actual page breaks. `orientation: auto` evaluates both
+orientations. Accepted smart layouts use numeric `PageSetup.Zoom` at or above
+`min_shrink_factor: 0.90`, with fit-to-pages flags disabled.
 
 If no candidate can satisfy the requested fit axes at the 90% quality floor,
-the default `oversized_action: paginate` keeps numeric Zoom at 90% and lets Excel paginate
-horizontally and vertically. The planner chooses the accepted layout with the
-fewest estimated pages, then the smaller paper. `error`, `skip`, and `warn`
-remain available for compatibility; `warn` may fit below the configured quality
-floor.
+the default `oversized_action: paginate` keeps numeric Zoom at 90% and lets Excel
+paginate horizontally and vertically. Strict ranking minimizes horizontal
+splits, total pages, preferred-paper rank, whitespace, and paper area in that
+order. `error`, `skip`, and `warn` remain available; low-quality `warn` is a
+legacy/balanced compatibility behavior.
 
 Set `row_dimensions` to `null` for natural vertical pagination, `0` to try a
 one-page-tall region before the quality-preserving fallback, or a positive row
 count to cap the number of source rows in each logical chunk. A chunk may still
 span physical pages rather than shrink below the floor. Existing multi-area
-PrintAreas are retained with `print_area_policy: preserve`; use `auto` to derive
-bounds from formula/value cells and visible shapes. `print_title_rows` and
+PrintAreas are retained with `print_area_policy: preserve`; strict mode uses
+`preserve_strict` and fails closed on an invalid area. Use `auto` to derive
+bounds from cells and printable objects. `print_title_rows` and
 `print_title_columns` accept Excel A1 ranges such as `$1:$2` and `$A:$B`; `null`
 preserves the workbook's existing settings.
 
@@ -150,10 +187,23 @@ preserves the workbook's existing settings.
 region to fit both width and height on one page even when `row_dimensions` is
 `null`.
 
-The PDF is exported to a unique staging file, validated, optionally trimmed,
-and only then atomically replaces the destination. Excel jobs run in spawned
-workers; timeout or trim failure leaves an existing destination untouched and
-never terminates unrelated Excel sessions.
+Strict/balanced sheets are exported separately and merged without rasterization.
+Postflight checks page ranges and boxes, blank pages, sentinel/searchable text,
+font sizes, image DPI, rasterization, clipping indicators, and page budgets.
+Versioned decision manifests are written under the configured reports directory.
+All export, merge, trim, and verification work uses unique staging paths; the
+parent worker replaces the destination only after final validation. Timeout or
+failure leaves an existing destination untouched.
+
+Strict Excel trimming is disabled by default. `cropbox` and explicit `physical`
+trim modes re-render at least 150 DPI and verify that text and source ink remain
+inside the resulting page boxes. Generic low-image-quality settings cannot
+downgrade strict Excel output.
+
+`one_logical_page`, `vector_stitch`, and PDF/A conversion are reserved extension
+points. They fail explicitly in M0-M5 because no stitch or standards-validation
+provider is bundled; Excel output is never labeled PDF/A without validator
+success. Set `compliance: standard` when opting into strict mode.
 
 ### Edge-case fixture pack
 
@@ -231,10 +281,6 @@ PDF trimming defaults are `render_dpi: 72`, `max_render_pixels: 20000000`,
 `background_tolerance: 8`, and `include_annotations: true`. Signed PDFs are
 refused unless signature invalidation is explicitly allowed. Encrypted PDFs
 require credentials.
-- `suffix`: PDF filename suffixes for Word, Excel, and PowerPoint.
-- `reporting`: result and error reports, plus copying failed source files.
-- `pdf_handling`: handling of existing PDF files in the input.
-- PDF and layout settings for Word, Excel, and PowerPoint, including pattern-based rules.
 
 `convert-macros` does not use the PDF settings in `config.yml`.
 
@@ -242,6 +288,15 @@ require credentials.
 
 ```powershell
 python -m pytest
+```
+
+Run the real two-workbook Excel acceptance test and record serial/parallel timing
+properties in JUnit output on a Windows host with desktop Excel:
+
+```powershell
+$env:DOC2PDF_RUN_EXCEL_INTEGRATION = "1"
+python -m pytest tests/test_excel_parallel_windows.py `
+  --junitxml reports/excel_parallel_integration.xml
 ```
 
 ## Operational Notes

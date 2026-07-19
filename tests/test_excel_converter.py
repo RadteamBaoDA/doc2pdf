@@ -12,6 +12,17 @@ from src.core.excel_converter import (
     PaperForm,
     SheetRegion,
 )
+from src.core.excel.printer import PrinterCapabilityProvider
+
+
+@pytest.fixture(autouse=True)
+def strict_printer_geometry():
+    with patch.object(
+        PrinterCapabilityProvider,
+        "hard_margins_points",
+        return_value=(0.0, 0.0, 0.0, 0.0),
+    ):
+        yield
 
 
 class StrictPageSetup:
@@ -19,7 +30,7 @@ class StrictPageSetup:
         "Application", "Orientation", "PaperSize", "LeftMargin", "RightMargin",
         "TopMargin", "BottomMargin", "Zoom", "FitToPagesWide",
         "FitToPagesTall", "BlackAndWhite", "PrintArea",
-        "PrintTitleRows", "PrintTitleColumns",
+        "PrintTitleRows", "PrintTitleColumns", "Draft", "Order",
     }
 
     def __init__(self, app):
@@ -37,6 +48,8 @@ class StrictPageSetup:
         object.__setattr__(self, "PrintArea", "")
         object.__setattr__(self, "PrintTitleRows", "")
         object.__setattr__(self, "PrintTitleColumns", "")
+        object.__setattr__(self, "Draft", False)
+        object.__setattr__(self, "Order", 1)
 
     def __setattr__(self, name, value):
         if name not in self.allowed:
@@ -313,6 +326,25 @@ def test_page_setup_honors_forced_orientation_and_auto_chooses_better_scale():
     assert portrait_sheet.PageSetup.Zoom == 70
     assert auto_sheet.PageSetup.Orientation == 2
     assert auto_sheet.PageSetup.Zoom == 100
+
+
+def test_printer_probe_cache_skips_rejected_and_accepted_reprobes():
+    converter = ExcelConverter()
+    sheet, _ = _strict_sheet()
+    form = PaperForm(9, "A4", 8.27, 11.69)
+
+    with patch.object(
+        converter, "_try_set_paper_size", return_value=True
+    ) as setter:
+        first = converter._probe_paper_orientation(
+            sheet.PageSetup, form, 1, (36.0, 36.0, 36.0, 36.0), True
+        )
+        second = converter._probe_paper_orientation(
+            sheet.PageSetup, form, 1, (36.0, 36.0, 36.0, 36.0), True
+        )
+
+    assert first == second
+    assert setter.call_count == 1
 
 
 def test_page_setup_does_not_count_vertical_margins_twice():
@@ -754,6 +786,7 @@ def test_skip_rolls_back_previously_staged_chunks_and_page_count(tmp_path):
     valid_regions = [SheetRegion(1, 1, 10, 5)]
     settings = PDFConversionSettings(
         excel=ExcelSettings(
+            quality_profile="legacy",
             row_dimensions=0,
             oversized_action="skip",
             metadata_header=False,

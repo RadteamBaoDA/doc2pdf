@@ -23,6 +23,18 @@ timeout:
   excel_trim: 3600
 
 # ============================================================================
+# PARALLEL CONVERSION
+# ============================================================================
+# Excel workbooks are isolated in separate spawned processes and may be
+# converted concurrently. Auto mode is bounded by CPU, available memory, and
+# the configured cap. Set an integer to force a fixed worker count.
+parallel:
+  # "auto" or an integer in the range 1-8
+  excel_workers: "auto"
+  # Maximum workers selected by auto mode (valid range: 1-8)
+  excel_worker_cap: 4
+
+# ============================================================================
 # LOGGING CONFIGURATION
 # ============================================================================
 # Controls how the application logs information during conversion.
@@ -247,6 +259,12 @@ pdf_settings:
     - sheet_name: "*"
       priority: 10
       settings:
+        # Quality-first default. Use "legacy" only as an explicit compatibility
+        # escape hatch for workbooks that depend on the older layout pipeline.
+        # Options: "legacy" | "balanced" | "strict"
+        quality_profile: "legacy"
+        compliance: "standard"
+
         # Page orientation
         # Options: "auto" | "portrait" | "landscape"
         # "auto" evaluates both orientations and chooses the best quality.
@@ -258,7 +276,7 @@ pdf_settings:
         #   0: Try one page first, then paginate if needed to preserve quality
         #   N (positive integer): Maximum N rows per chunk
         # Example: 10 means each chunk contains at most 10 rows of data
-        row_dimensions: 10
+        row_dimensions: null
 
         # Print metadata header on each page
         # Values: true | false
@@ -273,7 +291,7 @@ pdf_settings:
         # Values: true | false
         # When true: Inserts new row at top with sheet name (font size 23, bold)
         # Useful for: OCR systems that need clear sheet identification
-        ocr_sheet_name_label: true
+        ocr_sheet_name_label: false
 
         # Action when sheet exceeds printable size (shrink factor < min_shrink_factor)
         # Options:
@@ -295,6 +313,22 @@ pdf_settings:
         # When true: Inserts new row before last row with absolute file path (centered)
         # Useful for: Traceability - knowing which file a PDF page came from
         is_write_file_path: false
+
+    # Strict opt-in example. PDF/A remains unavailable until an M6 provider is
+    # installed, so strict conversions request ordinary validated PDF.
+    # - sheet_name: "*"
+    #   priority: 20
+    #   settings:
+    #     compliance: "standard"
+    #     quality_profile: "strict"
+    #     layout_policy: "preserve_authored"
+    #     page_size_scope: "sheet"
+    #     row_dimensions: null
+    #     print_area_policy: "preserve_strict"
+    #     printer_policy: "required"
+    #     printer_name: "Microsoft Print to PDF"
+    #     postflight_policy: "strict"
+    #     trim_policy: "disabled"
 
     # Example: Summary sheets - fit on one page with file path
     - sheet_name: "*Summary*"

@@ -5,15 +5,16 @@ import pytest
 
 from src.config import (
     ExcelSettings,
+    ParallelSettings,
     PDFConversionSettings,
     TrimWhitespaceSettings,
     _merge_dict,
     get_excel_sheet_settings,
+    get_parallel_config,
     get_pdf_handling_config,
     get_pdf_settings,
     load_config,
 )
-
 
 # Mock config data
 MOCK_CONFIG = {
@@ -66,6 +67,47 @@ def test_merge_dict():
     # Base should not be mutated
     assert base["a"] == 1
 
+
+def test_parallel_settings_default_to_adaptive_workers():
+    settings = ParallelSettings()
+    assert settings.excel_workers == "auto"
+    assert settings.excel_worker_cap == 4
+
+
+def test_parallel_settings_resolves_cpu_memory_and_fallback_limits():
+    settings = ParallelSettings()
+    assert settings.resolve_excel_workers(
+        10, logical_cpus=16, available_memory_mb=16_384
+    ) == 4
+    assert settings.resolve_excel_workers(
+        10, logical_cpus=16, available_memory_mb=3_000
+    ) == 1
+    assert settings.resolve_excel_workers(
+        10, logical_cpus=16, available_memory_mb=None
+    ) == 2
+
+
+@pytest.mark.parametrize("workers", [1, 2, 8])
+def test_parallel_settings_accept_supported_worker_counts(workers):
+    assert ParallelSettings(excel_workers=workers).excel_workers == workers
+
+
+@pytest.mark.parametrize("workers", [True, False, 0, 9, -1, 1.5, "2"])
+def test_parallel_settings_reject_invalid_worker_counts(workers):
+    with pytest.raises(ValueError, match="parallel.excel_workers"):
+        ParallelSettings(excel_workers=workers)
+
+
+def test_get_parallel_config_loads_explicit_serial_mode():
+    with patch("src.config.load_config", return_value={"parallel": {"excel_workers": 1}}):
+        assert get_parallel_config().excel_workers == 1
+
+
+def test_get_parallel_config_rejects_non_mapping_section():
+    with patch("src.config.load_config", return_value={"parallel": 2}):
+        with pytest.raises(ValueError, match="parallel must be a mapping"):
+            get_parallel_config()
+
 def test_get_pdf_settings_default_word(mock_load_config):
     # Test getting defaults for a standard file
     settings = get_pdf_settings(input_path=Path("input/doc.docx"), file_type="word")
@@ -76,6 +118,11 @@ def test_get_pdf_settings_default_word(mock_load_config):
     # Metadata should follow class defaults if not specified, 
     # but here defaults are True in dataclass.
     assert settings.metadata.include_properties is True
+
+
+def test_programmatic_defaults_use_strict_excel_and_standard_pdf():
+    assert PDFConversionSettings().compliance == "standard"
+    assert ExcelSettings().quality_profile == "strict"
 
 def test_get_pdf_settings_pattern_override(mock_load_config):
     # Test override logic
@@ -135,6 +182,7 @@ def test_get_pdf_handling_config(mock_load_config):
 def test_excel_settings_quality_first_defaults():
     settings = ExcelSettings()
 
+    assert settings.quality_profile == "strict"
     assert settings.orientation == "auto"
     assert settings.min_shrink_factor == pytest.approx(0.90)
     assert settings.oversized_action == "paginate"

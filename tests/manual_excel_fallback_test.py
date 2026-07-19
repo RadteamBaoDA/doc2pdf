@@ -10,7 +10,7 @@ from src.config import ExcelSettings
 
 def test_fallback_logic():
     converter = ExcelConverter()
-    settings = ExcelSettings()
+    settings = ExcelSettings(quality_profile="legacy")
     settings.orientation = "landscape"
     
     print("\n--- Testing Page Size Fallback Logic ---\n")

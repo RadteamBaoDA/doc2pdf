@@ -1,14 +1,14 @@
 from collections import deque
 from datetime import datetime
-from typing import Optional
+from threading import Lock
 
-from rich.console import RenderableType, Group
+from rich import box
+from rich.console import RenderableType
 from rich.layout import Layout
 from rich.panel import Panel
-from rich.text import Text
-from rich.align import Align
 from rich.table import Table
-from rich import box
+from rich.text import Text
+
 
 class LogBuffer:
     """Captures logs for display in the TUI."""
@@ -16,43 +16,60 @@ class LogBuffer:
         self.queue = deque(maxlen=maxlen)
         self.scroll_offset = 0
         self.view_height = 20 # Approximate view height, adjustable
+        self._lock = Lock()
+        self._changed = False
     
     def write(self, message: str):
         if message.strip():
-             self.queue.append(message.strip())
-             # Auto-scroll if at bottom (offset 0)
-             if self.scroll_offset > 0:
-                 self.scroll_offset += 1
+             with self._lock:
+                 self.queue.append(message.strip())
+                 # Auto-scroll if at bottom (offset 0)
+                 if self.scroll_offset > 0:
+                     self.scroll_offset += 1
+                 self._changed = True
+
+    def consume_changed(self) -> bool:
+        """Return whether new logs arrived since the last TUI refresh."""
+        with self._lock:
+            changed = self._changed
+            self._changed = False
+            return changed
 
     def scroll_up(self):
         """Scroll up (view older logs)."""
-        if self.scroll_offset < len(self.queue) - self.view_height:
-            self.scroll_offset += 1
+        with self._lock:
+            if self.scroll_offset < len(self.queue) - self.view_height:
+                self.scroll_offset += 1
+                self._changed = True
 
     def scroll_down(self):
         """Scroll down (view newer logs)."""
-        if self.scroll_offset > 0:
-            self.scroll_offset -= 1
+        with self._lock:
+            if self.scroll_offset > 0:
+                self.scroll_offset -= 1
+                self._changed = True
 
     def get_renderable(self) -> RenderableType:
-        # Calculate slice
-        total = len(self.queue)
-        if total == 0:
-            text = ""
-        else:
-            if self.scroll_offset == 0:
-                # Show latest
-                visible = list(self.queue)[-self.view_height:]
+        with self._lock:
+            # Calculate slice from a consistent snapshot while worker threads log.
+            total = len(self.queue)
+            if total == 0:
+                text = ""
             else:
-                # Show history
-                end = total - self.scroll_offset
-                start = max(0, end - self.view_height)
-                visible = list(self.queue)[start:end]
-            text = "\n".join(visible)
+                if self.scroll_offset == 0:
+                    # Show latest
+                    visible = list(self.queue)[-self.view_height:]
+                else:
+                    # Show history
+                    end = total - self.scroll_offset
+                    start = max(0, end - self.view_height)
+                    visible = list(self.queue)[start:end]
+                text = "\n".join(visible)
+            scrolled = self.scroll_offset > 0
             
         return Panel(
             Text.from_markup(text),
-            title=f"Application Logs {'(SCROLLED)' if self.scroll_offset > 0 else ''}",
+            title=f"Application Logs {'(SCROLLED)' if scrolled else ''}",
             border_style="blue",
             box=box.ROUNDED
         )
